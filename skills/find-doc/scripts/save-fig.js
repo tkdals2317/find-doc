@@ -15,6 +15,21 @@ const mod__TAG__ = P__TAG__.mac ? 'Meta' : 'Control';
 
 let state__TAG__ = 'opening';
 try {
+  // Figma 에 계정이 여러 개 로그인돼 있으면 "Choose an account to open" 화면이 먼저 뜬다 → 설정한 계정을 고른다
+  for (let i = 0; i < 20; i++) {
+    const t = await pg__TAG__.evaluate(() => document.body ? document.body.innerText.slice(0, 400) : '');
+    if (/Choose an account to open/i.test(t)) {
+      const sa = await snapshot(pg__TAG__, { interactive: true });
+      const btns = [...sa.tree.matchAll(/button "([^"]*)" \[ref=(e\d+)\]: "([^"]*)"/g)].map(m => ({ name: m[1], ref: m[2], text: m[3] }));
+      const want = (P__TAG__.account || '').toLowerCase();
+      const pick = (want && btns.find(b => (b.name + ' ' + b.text).toLowerCase().includes(want)))
+        || btns.find(b => /Editor on file/i.test(b.text)) || btns[0];
+      if (pick) { await pg__TAG__.locator(pick.ref).click(); emit__TAG__({ kind: 'account', picked: pick.name }); await sleep(3000); }
+      break;
+    }
+    if (await pg__TAG__.evaluate(() => document.querySelectorAll('[data-testid="PagesRowWrapper"]').length)) break;
+    await sleep(750);
+  }
   // 파일이 열릴 때까지 (페이지 목록이 보이면 준비된 것)
   for (let i = 0; i < 40; i++) {
     const n = await pg__TAG__.evaluate(() => document.querySelectorAll('[data-testid="PagesRowWrapper"]').length);

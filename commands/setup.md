@@ -34,6 +34,7 @@ description: find-doc 최초 설정 (Atlassian 주소·자격증명, Jira 프로
 6. **Figma** (doctor 의 `aside` 가 true 일 때만; false 면 README 의 'Aside CLI 설치'(Windows 는 수동 설치 PowerShell) 를 보여주고, "Aside 를 설치하면 Figma 전체 검색이 돼요. 지금은 Jira·Confluence 에 붙은 Figma 링크만 찾아요" 라고 알리고 7번으로)
    - `FD figma-orgs` → 로그인 오류면 Aside 브라우저에서 figma.com 에 로그인해 달라고 하고 기다려.
    - 조직이 하나면 그대로, 여럿이면 고르게 해서 `FD figma-setup --org <id> --name <이름>`.
+   - Aside 브라우저에 Figma 계정이 여러 개 로그인돼 있으면 파일을 열 때 "Choose an account to open" 화면이 뜬다. 어떤 계정으로 열지 물어보고(팀 멤버인 계정) `FD config set figma.account '"<계정 이름 또는 이메일 앞부분>"'` 로 저장. 비워 두면 "Editor on file" 계정을 고른다.
    - **지정 파일(레이어까지 찾을 기획서) 받기**: "레이어 단위까지 찾고 싶은 Figma 링크를 붙여 주세요. 파일 링크도 되고, 팀이나 프로젝트 링크를 주면 그 아래 파일을 전부 등록해요" 라고 물어. 건너뛰어도 된다.
      - 파일 링크(`figma.com/design/…`) → `FD focus add <url> ...`
      - 팀 링크(`figma.com/files/…/team/<id>/…`)나 프로젝트 링크(`…/project/<id>/…`) → `FD focus add-team <url> ...`

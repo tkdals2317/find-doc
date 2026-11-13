@@ -1,6 +1,6 @@
 {
   "name": "find-doc",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "자연어로 Jira·Confluence·Figma 기획서 링크를 찾아준다. Jira·Confluence 검색 + 로컬 Figma 인덱스 + Claude 리랭킹.",
   "author": { "name": "tkdals2317" },
   "keywords": ["figma", "jira", "confluence", "search", "기획서"]

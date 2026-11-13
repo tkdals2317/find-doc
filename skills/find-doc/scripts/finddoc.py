@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
         "jira_projects": [],
         "conf_spaces": [],
     },
-    "figma": {"enabled": False, "org_id": "", "org_name": "", "focus_files": []},
+    "figma": {"enabled": False, "org_id": "", "org_name": "", "account": "", "focus_files": []},
     "extra_keywords": [],
     "default_scope": ["figma", "jira", "conf"],
 }
@@ -808,7 +808,8 @@ def save_fig(f, tab_id=None):
 
 def _save_fig(f, tab_id=None):
     tpl = open(os.path.join(HERE, "save-fig.js"), encoding="utf-8").read()
-    params = {"key": f["key"], "tabId": tab_id, "budgetMs": SAVE_BUDGET_MS, "mac": sys.platform == "darwin"}
+    params = {"key": f["key"], "tabId": tab_id, "budgetMs": SAVE_BUDGET_MS, "mac": sys.platform == "darwin",
+              "account": load_config()["figma"].get("account", "")}
     t0 = now().timestamp()
     js = tpl.replace("__TAG__", f"F{os.getpid()}").replace("__FD_PARAMS__", json.dumps(params))
     rows, tail = aside_js(js, timeout=170)
