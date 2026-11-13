@@ -97,7 +97,7 @@ claude plugin update find-doc@find-doc
 | `/find-doc:add <figma 파일 URL> [메모]` | 파일 링크 직접 등록 |
 | `/find-doc:add <팀·프로젝트 URL>` | 그 아래 디자인 파일 전부를 레이어 인덱싱 대상으로 등록 |
 
-지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--limit N]` 로 레이어 인덱싱.
+지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--workers 3] [--limit N]` 로 레이어 인덱싱. `--workers` 는 동시에 여는 Figma 탭 수(기본 3, 최대 6). 같은 이름 파일은 다운로드가 섞이지 않게 한 번에 하나씩 처리한다.
 
 ## 파일 위치
 

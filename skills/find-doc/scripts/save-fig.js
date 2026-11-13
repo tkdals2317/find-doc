@@ -70,7 +70,11 @@ try {
   emit__TAG__({ kind: 'error', error: String(e).slice(0, 200), state: state__TAG__ });
 }
 if (own__TAG__) {
-  // 무거운 Figma 탭은 바로 닫기가 실패할 때가 있어 먼저 비운다
-  try { await pg__TAG__.goto('about:blank', { timeout: 10000 }); } catch (e) {}
-  try { await closeTab(pg__TAG__); } catch (e) {}
+  // 바로 닫는다. 무거운 Figma 탭이라 닫기가 실패했을 때만 페이지를 비우고 다시 닫는다.
+  let closed__TAG__ = true;
+  try { await closeTab(pg__TAG__); } catch (e) { closed__TAG__ = false; }
+  if (!closed__TAG__) {
+    try { await pg__TAG__.goto('about:blank', { timeout: 10000 }); } catch (e) {}
+    try { await closeTab(pg__TAG__); } catch (e) {}
+  }
 }

@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -765,22 +766,47 @@ def downloads_dir():
     return os.path.join(os.path.expanduser("~"), "Downloads")
 
 
+_LOCK = threading.Lock()          # meta.json·config 쓰기, 다운로드 파일 선점
+_PARSE_LOCK = threading.Lock()    # .fig 해석은 메모리를 많이 써서 한 번에 하나
+_NAME_LOCKS = {}                  # 같은 이름 파일은 동시에 저장하지 않는다 (다운로드 이름이 겹침)
+_CLAIMED = set()
+
+
+def _norm(n):
+    return re.sub(r"[^0-9a-z가-힣]+", "", (n or "").lower())
+
+
 def find_saved_fig(after_ts, name):
-    """브라우저 기본 다운로드 폴더에서 방금 저장된 '<파일명> - Partial file saved ….fig' 를 찾는다."""
+    """다운로드 폴더에서 방금 저장된 '<파일명>( - Partial file saved …).fig' 를 이름으로 찾아 선점한다."""
     d = downloads_dir()
+    want = _norm(name)
     best = None
-    for fn in os.listdir(d) if os.path.isdir(d) else []:
-        if not fn.lower().endswith(".fig"):
-            continue
-        p = os.path.join(d, fn)
-        mt = os.path.getmtime(p)
-        if mt >= after_ts - 2 and (best is None or mt > best[0]):
-            best = (mt, p)
+    with _LOCK:
+        for fn in os.listdir(d) if os.path.isdir(d) else []:
+            if not fn.lower().endswith(".fig"):
+                continue
+            p = os.path.join(d, fn)
+            if p in _CLAIMED or os.path.getmtime(p) < after_ts - 2:
+                continue
+            if want and not _norm(fn).startswith(want[:60]):
+                continue
+            mt = os.path.getmtime(p)
+            if best is None or mt > best[0]:
+                best = (mt, p)
+        if best:
+            _CLAIMED.add(best[1])
     return best[1] if best else None
 
 
 def save_fig(f, tab_id=None):
-    """Aside 로 .fig 로컬 사본을 저장하고 경로를 돌려준다."""
+    """Aside 로 .fig 로컬 사본을 저장하고 경로를 돌려준다. 같은 이름 파일은 동시에 저장하지 않는다."""
+    with _LOCK:
+        lk = _NAME_LOCKS.setdefault(_norm(f["name"]), threading.Lock())
+    with lk:
+        return _save_fig(f, tab_id)
+
+
+def _save_fig(f, tab_id=None):
     tpl = open(os.path.join(HERE, "save-fig.js"), encoding="utf-8").read()
     params = {"key": f["key"], "tabId": tab_id, "budgetMs": SAVE_BUDGET_MS, "mac": sys.platform == "darwin"}
     t0 = now().timestamp()
@@ -829,7 +855,8 @@ def crawl_file(f, force, tab_id=None, fig_path=None):
     size_mb = round(os.path.getsize(work) / 1e6, 1)
     try:
         t1 = now()
-        rows = figfile.layers(work)
+        with _PARSE_LOCK:
+            rows = figfile.layers(work)
         parse_s = int((now() - t1).total_seconds())
     except Exception as ex:  # noqa: BLE001
         bad = work + ".failed"
@@ -851,13 +878,18 @@ def crawl_file(f, force, tab_id=None, fig_path=None):
                                 ensure_ascii=False) + "\n")
             kept += 1
     os.replace(tmp, os.path.join(LAYER_DIR, key + ".jsonl"))
+    with _LOCK:
+        _save_layer_meta(key, f["name"], rows, kept)
+    return {"key": key, "name": f["name"], "fig_mb": size_mb, "nodes": len(rows), "layers": kept,
+            "parse_seconds": parse_s, "seconds": int((now() - t0).total_seconds())}
+
+
+def _save_layer_meta(key, name, rows, kept):
     meta = load_json(META, {})
-    meta.setdefault("layers", {})[key] = {"name": f["name"], "crawled_at": now().isoformat(timespec="seconds"),
+    meta.setdefault("layers", {})[key] = {"name": name, "crawled_at": now().isoformat(timespec="seconds"),
                                           "pages": len({r["page_id"] for r in rows}), "nodes": len(rows),
                                           "layers": kept, "complete": True}
     save_json(META, meta)
-    return {"key": key, "name": f["name"], "fig_mb": size_mb, "nodes": len(rows), "layers": kept,
-            "parse_seconds": parse_s, "seconds": int((now() - t0).total_seconds())}
 
 
 def cmd_crawl(a):
@@ -871,12 +903,24 @@ def cmd_crawl(a):
         die("지정 파일이 없습니다. 'focus add <figma URL...>' 로 먼저 등록하세요.")
     if a.limit:
         files = files[: a.limit]
-    res = []
-    for i, f in enumerate(files, 1):
-        print(f"  [{i}/{len(files)}] {f['name']}: 확인 중…", file=sys.stderr)
+    res, cnt = [], [0]
+    workers = max(1, min(a.workers, 6)) if not (a.fig or a.tab) else 1
+
+    def run(f):
         r = crawl_file(f, a.force, a.tab, a.fig)
-        print(f"  {f['name']}: {r.get('error') or r.get('skipped') or str(r.get('layers')) + '개 레이어'}", file=sys.stderr)
-        res.append(r)
+        with _LOCK:
+            cnt[0] += 1
+            msg = r.get("error") or r.get("skipped") or f"{r.get('layers')}개 레이어 ({r.get('seconds')}초)"
+            print(f"  [{cnt[0]}/{len(files)}] {f['name']}: {msg}", file=sys.stderr, flush=True)
+        return r
+
+    if workers == 1:
+        res = [run(f) for f in files]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"  {len(files)}개 파일을 탭 {workers}개로 동시에 처리합니다", file=sys.stderr, flush=True)
+        with ThreadPoolExecutor(workers) as ex:
+            res = list(ex.map(run, files))
     done = [r for r in res if "layers" in r]
     out({"ok": all("error" not in r for r in res), "indexed": len(done),
          "skipped": sum("skipped" in r for r in res), "errors": [r for r in res if "error" in r],
@@ -1155,6 +1199,7 @@ def main():
     p.add_argument("--tab", help="Aside 에 직접 열어 둔 Figma 탭 id (큰 파일용)")
     p.add_argument("--fig", help="직접 받은 .fig 파일 경로 (--key 하나와 함께)")
     p.add_argument("--limit", type=int, help="이번에 처리할 최대 파일 수 (나머지는 다음 실행 때)")
+    p.add_argument("--workers", type=int, default=3, help="동시에 여는 Figma 탭 수 (기본 3, 최대 6)")
     p.set_defaults(fn=cmd_crawl)
     p = sp.add_parser("atl-search"); p.add_argument("query"); p.add_argument("--kw", nargs="*")
     p.add_argument("--in", dest="scope", default="jira,conf"); p.add_argument("--jira"); p.add_argument("--conf")
