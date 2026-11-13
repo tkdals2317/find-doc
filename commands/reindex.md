@@ -8,7 +8,7 @@ argument-hint: "[--restart] [--layers-only] [--force]"
 > Windows 에서 `python3` 가 없으면 `py -3` 으로 바꿔 실행한다. 경로의 `${CLAUDE_PLUGIN_ROOT}` 는 그대로 둔다.
 
 1. `--layers-only` 가 없으면: `FD reindex` (+ `--restart` 가 있으면 붙여서)
-2. 지정 파일이 있으면: `FD crawl` (+ `--force` 가 있으면 붙여서). 수정되지 않은 파일은 자동으로 건너뛴다.
+2. 지정 파일이 있으면: `FD crawl` (+ `--force` 가 있으면 붙여서). 등록된 팀·프로젝트는 먼저 새 파일을 자동으로 추가하고, 수정되지 않은 파일은 건너뛴다. 파일이 많으면 오래 걸릴 수 있으니 백그라운드로 돌리고, 끝나면 `indexed`·`skipped`·`errors` 수를 한 줄로 알려줘.
 
 - 진행 상황(stderr)은 길게 옮기지 말고, 끝났을 때 한두 줄로 요약해: 파일 수, 새 파일 수, 레이어 수, 일부만 읽힌 페이지 수.
 - `ok: false` 면 `error` 를 그대로 보여주고 안내해:

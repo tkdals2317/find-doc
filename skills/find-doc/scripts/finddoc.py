@@ -12,7 +12,7 @@ stdlib 만 쓴다. 모든 출력은 JSON(stdout). 사람용 메시지는 stderr.
   atl-search QUERY --kw KW... [--in jira,conf] [--jira P,..] [--conf S,..]
                                  Jira·Confluence JQL/CQL 검색
   add URL [NOTE...]              Figma 링크 직접 등록 (파일 단위)
-  focus add URL... | focus remove KEY... | focus list
+  focus add URL... | focus add-team TEAM_OR_PROJECT_URL... | focus remove KEY... | focus list
                                  레이어까지 깊게 인덱싱할 '지정 파일' 관리
   crawl [--key KEY...] [--force] [--tab ID]
                                  지정 파일의 .fig 사본을 받아 페이지·프레임·레이어 인덱싱 (파일당 수 분)
@@ -630,6 +630,80 @@ def node_url(key, node):
     return f"https://www.figma.com/design/{key}?node-id={node.replace(':', '-')}"
 
 
+TEAM_RE = re.compile(r"figma\.com/files/(?:[^/]+/)?team/(\d+)")
+FOLDER_RE = re.compile(r"figma\.com/files/(?:[^/]+/)?project/(\d+)")
+CRAWL_TYPES = {"design"}  # .fig 로 저장·해석되는 종류 (FigJam·Slides 는 형식이 달라 제외)
+
+
+def team_files(url):
+    """팀 또는 프로젝트(폴더) 링크 → (출처 설명, 파일 목록). 팀 멤버여야 목록을 볼 수 있다."""
+    m_team, m_folder = TEAM_RE.search(url), FOLDER_RE.search(url)
+    if not (m_team or m_folder):
+        raise RuntimeError("팀(…/files/…/team/<id>/…) 또는 프로젝트(…/project/<id>/…) 링크가 아닙니다.")
+    if m_team:
+        tid = m_team.group(1)
+        r = figma_get([f"/api/teams/{tid}", f"/api/teams/{tid}/folders"])
+        if r[1].get("status") != 200:
+            raise RuntimeError(f"팀 폴더 목록을 볼 수 없습니다 (HTTP {r[1].get('status')}). 이 팀의 멤버인지 확인하세요.")
+        tname = ((r[0].get("json") or {}).get("meta") or {}).get("name") or tid
+        rows = ((r[1].get("json") or {}).get("meta") or {}).get("folder_rows") or []
+        folders = [(f["id"], f.get("name") or f.get("path") or f["id"]) for f in rows
+                   if not f.get("trashed_at") and not f.get("deleted_at")]
+        src = {"kind": "team", "id": tid, "name": tname, "url": url}
+    else:
+        fid = m_folder.group(1)
+        folders = [(fid, None)]
+        src = {"kind": "project", "id": fid, "name": None, "url": url}
+    files = []
+    if folders:
+        r = figma_get([f"/api/folders/{fid}/files" for fid, _ in folders])
+        for (fid, fname), resp in zip(folders, r):
+            if resp.get("status") != 200:
+                print(f"  프로젝트 {fname or fid}: 볼 수 없음 (HTTP {resp.get('status')})", file=sys.stderr)
+                continue
+            meta = (resp.get("json") or {}).get("meta") or {}
+            fname = fname or (meta.get("folder") or {}).get("name") or (meta.get("folder") or {}).get("path") or fid
+            if src["kind"] == "project" and not src["name"]:
+                src["name"] = fname
+            for f in meta.get("files") or []:
+                if f.get("trashed_at") or f.get("deleted_at") or f.get("source_file_key"):
+                    continue  # 휴지통·삭제·브랜치 제외
+                files.append({"key": f["key"], "name": f.get("name") or f["key"], "editor_type": f.get("editor_type"),
+                              "updated_at": (f.get("updated_at") or "")[:10], "folder": fname,
+                              "url": f"https://www.figma.com/design/{f['key']}"})
+    return src, files
+
+
+def sync_focus_teams(cfg, verbose=True):
+    """등록된 팀·프로젝트의 파일 목록을 다시 받아 지정 파일에 반영한다 (새 파일 추가, 수정일 갱신)."""
+    files = cfg["figma"].setdefault("focus_files", [])
+    by_key = {f["key"]: f for f in files}
+    added, skipped_types = [], 0
+    for t in cfg["figma"].get("focus_teams", []):
+        try:
+            src, tf = team_files(t["url"])
+        except RuntimeError as ex:
+            print(f"  팀 {t.get('name')}: {ex}", file=sys.stderr)
+            continue
+        for f in tf:
+            if f["editor_type"] not in CRAWL_TYPES:
+                skipped_types += 1
+                continue
+            cur = by_key.get(f["key"])
+            if cur:
+                cur.update({"name": f["name"], "updated_at": f["updated_at"], "folder": f["folder"]})
+            else:
+                e = {"key": f["key"], "name": f["name"], "url": f["url"], "updated_at": f["updated_at"],
+                     "folder": f["folder"], "team": src["name"]}
+                files.append(e)
+                by_key[f["key"]] = e
+                added.append(f["name"])
+    save_json(CONFIG, cfg)
+    if verbose and added:
+        print(f"  팀에서 새 파일 {len(added)}개 추가", file=sys.stderr)
+    return added, skipped_types
+
+
 def cmd_focus(a):
     cfg = load_config()
     files = cfg["figma"].setdefault("focus_files", [])
@@ -648,13 +722,34 @@ def cmd_focus(a):
             added.append(name)
         save_json(CONFIG, cfg)
         out({"ok": True, "added": added, "focus_files": files})
+    elif a.action == "add-team":
+        if not a.urls:
+            die("팀 또는 프로젝트 링크가 필요합니다.")
+        teams = cfg["figma"].setdefault("focus_teams", [])
+        srcs = []
+        for u in a.urls:
+            try:
+                src, tf = team_files(u)
+            except RuntimeError as ex:
+                die(str(ex), url=u)
+            if not any(t["kind"] == src["kind"] and t["id"] == src["id"] for t in teams):
+                teams.append(src)
+            srcs.append({**src, "files": len(tf), "design_files": sum(f["editor_type"] in CRAWL_TYPES for f in tf)})
+        added, skipped = sync_focus_teams(cfg, verbose=False)
+        todo = len(added)
+        out({"ok": True, "sources": srcs, "added": len(added), "added_names": added[:30],
+             "skipped_non_design": skipped, "focus_files": len(cfg["figma"]["focus_files"]),
+             "estimate_minutes": [todo * 1, todo * 3],
+             "next": "crawl 을 실행하면 새로 추가된 파일을 하나씩 인덱싱합니다 (파일당 1~3분, 중간에 멈춰도 다시 실행하면 이어서)."})
     elif a.action == "remove":
         cfg["figma"]["focus_files"] = [x for x in files if x["key"] not in a.urls]
+        cfg["figma"]["focus_teams"] = [t for t in cfg["figma"].get("focus_teams", []) if t["id"] not in a.urls]
         save_json(CONFIG, cfg)
         out({"ok": True, "focus_files": cfg["figma"]["focus_files"]})
     else:
         lm = load_json(META, {}).get("layers", {})
-        out({"ok": True, "focus_files": [dict(x, layers=lm.get(x["key"])) for x in files]})
+        out({"ok": True, "focus_teams": cfg["figma"].get("focus_teams", []),
+             "focus_files": [dict(x, layers=(lm.get(x["key"]) or {}).get("layers")) for x in files]})
 
 
 # Figma 가 자동으로 붙인 이름 (Frame 427320828, Group 3472520 …) — 검색에 쓸모없어 저장·표시에서 뺀다
@@ -717,7 +812,7 @@ def crawl_file(f, force, tab_id=None, fig_path=None):
     key = f["key"]
     meta = load_json(META, {})
     prev = meta.get("layers", {}).get(key, {})
-    file_updated = (load_index().get(key) or {}).get("updated_at")
+    file_updated = f.get("updated_at") or (load_index().get(key) or {}).get("updated_at")
     if (not force and prev.get("complete") and days_since(prev.get("crawled_at")) < 30
             and (not file_updated or file_updated <= (prev.get("crawled_at") or "")[:10])):
         return {"key": key, "name": f["name"], "skipped": "최근에 인덱싱했고 파일 수정이 없음"}
@@ -767,18 +862,25 @@ def crawl_file(f, force, tab_id=None, fig_path=None):
 
 def cmd_crawl(a):
     cfg = load_config()
+    if cfg["figma"].get("focus_teams") and not a.key and not a.fig:
+        sync_focus_teams(cfg)
     files = cfg["figma"].get("focus_files", [])
     if a.key:
         files = [f for f in files if f["key"] in a.key]
     if not files:
         die("지정 파일이 없습니다. 'focus add <figma URL...>' 로 먼저 등록하세요.")
+    if a.limit:
+        files = files[: a.limit]
     res = []
-    for f in files:
-        print(f"  {f['name']}: .fig 저장 중…", file=sys.stderr)
+    for i, f in enumerate(files, 1):
+        print(f"  [{i}/{len(files)}] {f['name']}: 확인 중…", file=sys.stderr)
         r = crawl_file(f, a.force, a.tab, a.fig)
         print(f"  {f['name']}: {r.get('error') or r.get('skipped') or str(r.get('layers')) + '개 레이어'}", file=sys.stderr)
         res.append(r)
-    out({"ok": all("error" not in r for r in res), "files": res})
+    done = [r for r in res if "layers" in r]
+    out({"ok": all("error" not in r for r in res), "indexed": len(done),
+         "skipped": sum("skipped" in r for r in res), "errors": [r for r in res if "error" in r],
+         "layers_total": sum(r["layers"] for r in done), "files": res if len(res) <= 10 else done[:10]})
 
 
 def layer_query(kws, limit, must=None):
@@ -1047,11 +1149,12 @@ def main():
     p.add_argument("--limit", type=int, default=30); p.add_argument("--layer-limit", type=int, default=20)
     p.add_argument("--must", nargs="*", help="필수 맥락 단어: 페이지·상위 프레임·이름에 반드시 있어야 하는 단어 (예: 파싱)")
     p.set_defaults(fn=cmd_figma_query)
-    p = sp.add_parser("focus"); p.add_argument("action", choices=["add", "remove", "list"]); p.add_argument("urls", nargs="*")
+    p = sp.add_parser("focus"); p.add_argument("action", choices=["add", "add-team", "remove", "list"]); p.add_argument("urls", nargs="*")
     p.set_defaults(fn=cmd_focus)
     p = sp.add_parser("crawl"); p.add_argument("--key", nargs="*"); p.add_argument("--force", action="store_true")
     p.add_argument("--tab", help="Aside 에 직접 열어 둔 Figma 탭 id (큰 파일용)")
     p.add_argument("--fig", help="직접 받은 .fig 파일 경로 (--key 하나와 함께)")
+    p.add_argument("--limit", type=int, help="이번에 처리할 최대 파일 수 (나머지는 다음 실행 때)")
     p.set_defaults(fn=cmd_crawl)
     p = sp.add_parser("atl-search"); p.add_argument("query"); p.add_argument("--kw", nargs="*")
     p.add_argument("--in", dest="scope", default="jira,conf"); p.add_argument("--jira"); p.add_argument("--conf")

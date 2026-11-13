@@ -4,7 +4,7 @@
 
 - **Jira·Confluence**: JQL/CQL 키워드 검색. 제목에 걸린 것을 먼저, 본문에 걸린 것으로 나머지를 채운다.
 - **Figma**: 각자 PC 에 만든 Figma 인덱스. Aside 브라우저로 Figma 조직 검색을 키워드별로 미리 돌려 모아 둔다. 팀에 가입하지 않아도 조직에서 볼 수 있는 파일은 다 잡힌다.
-- **레이어 링크**: 설정 때 받은 '지정 파일'(자주 보는 핵심 기획서)은 페이지·프레임·레이어까지 인덱싱해서, Figma 의 Copy link to selection 과 같은 `?node-id=` 링크를 돌려준다.
+- **레이어 링크**: 설정 때 받은 '지정 파일'(자주 보는 기획서, 또는 팀·프로젝트 링크 아래 파일 전부)은 페이지·프레임·레이어까지 인덱싱해서, Figma 의 Copy link to selection 과 같은 `?node-id=` 링크를 돌려준다.
 - **리랭킹**: Sonnet 서브에이전트가 후보를 질문 의도에 맞게 다시 골라 상위 10개와 고른 이유를 보여준다.
 
 ## 준비물
@@ -16,39 +16,63 @@
 | Atlassian API 토큰 | Jira·Confluence 검색 | Jira·Confluence 검색 불가 |
 | [Aside](https://aside.com) + Figma 로그인 | Figma 인덱스 | Jira·Confluence 에 붙은 Figma 링크만 찾음 |
 
-## Aside CLI 설치
+## 설치 — macOS
 
-- **macOS**: `curl -fsSL https://releases.aside.com/install.sh | bash`
-- **Windows**: 설치 스크립트는 macOS·Linux 전용이라 수동으로 넣는다. PowerShell 에서:
-  ```powershell
-  $d = "$env:LOCALAPPDATA\Programs\aside"; New-Item -ItemType Directory -Force $d | Out-Null
-  Invoke-WebRequest https://releases.aside.com/cli/AsideCLI-win-x64-latest.zip -OutFile "$env:TEMP\aside-cli.zip"
-  Expand-Archive "$env:TEMP\aside-cli.zip" $d -Force
-  [Environment]::SetEnvironmentVariable("Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$d", "User")
-  ```
-  새 터미널에서 `aside --version`, `aside repl "console.log(1)"` 이 되면 준비 끝. (Aside 브라우저 앱도 설치·로그인되어 있어야 한다)
-- Python 은 macOS `python3`, Windows `py -3` (python.org 설치본).
+1. **Python 3.14 이상**: `brew install python@3.14` 후 `python3 --version` 으로 확인.
+   3.13 이하를 계속 쓸 거면 `python3 -m pip install zstandard` (레이어 인덱싱용).
+2. **Aside** (Figma 검색용, 없으면 Jira·Confluence 만 검색)
+   - 브라우저 앱: https://aside.com/download 에서 설치 → 로그인 → Aside 안에서 figma.com 로그인
+   - CLI: `curl -fsSL https://releases.aside.com/install.sh | bash` → `aside --version` 확인
+3. **플러그인**
+   ```bash
+   claude plugin marketplace add tkdals2317/find-doc
+   claude plugin install find-doc@find-doc
+   ```
+4. Claude Code 재시작 → `/find-doc:setup`
 
-## 설치
+## 설치 — Windows
 
-터미널에서:
+> Windows 는 아직 실사용 검증 전이다. 막히는 곳이 있으면 화면과 오류 문구를 이슈로 남겨 주세요.
 
-```bash
-claude plugin marketplace add tkdals2317/find-doc
-claude plugin install find-doc@find-doc
-```
+1. **Python 3.14 이상** — PowerShell 에서:
+   ```powershell
+   winget install -e --id Python.Python.3.14
+   ```
+   (또는 python.org 설치 파일 — 설치 첫 화면에서 **"Add python.exe to PATH" 체크**)
+   새 PowerShell 창에서 `py -3 --version` 이 3.14 이상이면 끝. 3.13 이하를 쓸 거면 `py -3 -m pip install zstandard`.
+2. **Claude Code** — 공식 안내대로 설치하고 `claude --version` 확인. (Windows 용 Claude Code 는 Git for Windows 가 필요할 수 있다)
+3. **Aside 브라우저** — https://aside.com/download 에서 Windows 버전 설치 → 로그인 → Aside 안에서 figma.com 로그인.
+   다운로드 폴더는 기본값(`%USERPROFILE%\Downloads`)으로 둔다. Figma 사본을 여기서 찾는다.
+4. **Aside CLI** — 공식 설치 스크립트가 macOS·Linux 전용이라 수동으로 넣는다. PowerShell 에서 한 줄씩:
+   ```powershell
+   $d = "$env:LOCALAPPDATA\Programs\aside"; New-Item -ItemType Directory -Force $d | Out-Null
+   Invoke-WebRequest https://releases.aside.com/cli/AsideCLI-win-x64-latest.zip -OutFile "$env:TEMP\aside-cli.zip"
+   Expand-Archive "$env:TEMP\aside-cli.zip" $d -Force
+   [Environment]::SetEnvironmentVariable("Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$d", "User")
+   ```
+   **새** PowerShell 창에서 확인 (Aside 브라우저가 켜져 있어야 함):
+   ```powershell
+   aside --version
+   aside repl "console.log(1)"
+   ```
+   두 번째가 `1` 을 출력하면 준비 끝.
+5. **플러그인** — PowerShell 에서:
+   ```powershell
+   claude plugin marketplace add tkdals2317/find-doc
+   claude plugin install find-doc@find-doc
+   ```
+6. Claude Code 재시작 → `/find-doc:setup`
+   - 토큰 등록 단계에서 안내하는 `py -3 "…\finddoc.py" cred set` 은 **PowerShell 에 직접** 붙여 실행한다 (토큰은 입력해도 화면에 안 보이는 게 정상).
+   - 설정·인덱스는 `%USERPROFILE%\.config\find-doc\` 에 생긴다.
 
-또는 Claude Code 에 "GitHub tkdals2317/find-doc 플러그인 설치해줘" 라고 말해도 된다.
+## 설정 (공통, `/find-doc:setup`)
 
-Claude Code 를 재시작한 뒤:
+순서: Atlassian 주소 → 토큰 등록(본인 터미널에서 직접 입력) → Jira 프로젝트 → Confluence 스페이스 → Figma 조직 연결 → **레이어까지 찾을 Figma 링크**(파일·팀·프로젝트 링크) → 첫 인덱싱.
 
-```
-/find-doc:setup
-```
+- 조직 전체 파일 인덱스: 3~6분
+- 레이어 인덱스: 파일당 1~3분. **팀이나 프로젝트 링크를 주면 그 아래 디자인 파일을 전부** 등록하고, 이후 reindex 때 새 파일도 자동으로 추가한다 (팀 멤버여야 목록이 보인다). 파일이 많으면 오래 걸리니 백그라운드로 돌리고, 멈춰도 다시 실행하면 이어서 한다.
 
-설정 순서: Atlassian 주소 입력 → 토큰 등록(본인 터미널에서 직접 입력) → Jira 프로젝트 선택 → Confluence 스페이스 선택 → Figma 조직 연결 → 자주 보는 Figma 기획서 링크 등록 → 첫 인덱싱(조직 전체 3~6분 + 지정 파일당 1~3분).
-
-업데이트:
+## 업데이트
 
 ```bash
 claude plugin marketplace update find-doc
@@ -70,15 +94,18 @@ claude plugin update find-doc@find-doc
 | `/find-doc:search <질문> [--in figma,jira,conf]` | 검색 |
 | `/find-doc:setup` | 최초 설정 / 설정 변경 |
 | `/find-doc:reindex` | Figma 인덱스 갱신. 일주일에 한 번 권장. 중간에 끊겨도 이어서 진행 |
-| `/find-doc:add <figma URL> [메모]` | 링크 직접 등록 (파일 단위) |
+| `/find-doc:add <figma 파일 URL> [메모]` | 파일 링크 직접 등록 |
+| `/find-doc:add <팀·프로젝트 URL>` | 그 아래 디자인 파일 전부를 레이어 인덱싱 대상으로 등록 |
 
-지정 파일 관리: `finddoc.py focus add <url...>` / `focus list` / `focus remove <key>` → `/find-doc:reindex` 로 레이어 인덱싱.
+지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--limit N]` 로 레이어 인덱싱.
 
 ## 파일 위치
 
+macOS `~/.config/find-doc/`, Windows `%USERPROFILE%\.config\find-doc\`
+
 ```
 ~/.config/find-doc/
-├── config.json       # 프로젝트·스페이스·Figma 조직·개인 키워드
+├── config.json       # Atlassian 주소·프로젝트·스페이스·Figma 조직·지정 파일/팀·개인 키워드
 ├── credentials       # Atlassian 이메일·토큰 (권한 600)
 └── index/
     ├── figma.jsonl   # Figma 인덱스 (한 줄 = 파일 1개)

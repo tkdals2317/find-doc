@@ -34,13 +34,19 @@ description: find-doc 최초 설정 (Atlassian 주소·자격증명, Jira 프로
 6. **Figma** (doctor 의 `aside` 가 true 일 때만; false 면 README 의 'Aside CLI 설치'(Windows 는 수동 설치 PowerShell) 를 보여주고, "Aside 를 설치하면 Figma 전체 검색이 돼요. 지금은 Jira·Confluence 에 붙은 Figma 링크만 찾아요" 라고 알리고 7번으로)
    - `FD figma-orgs` → 로그인 오류면 Aside 브라우저에서 figma.com 에 로그인해 달라고 하고 기다려.
    - 조직이 하나면 그대로, 여럿이면 고르게 해서 `FD figma-setup --org <id> --name <이름>`.
-   - **지정 파일(자주 보는 기획서) 링크 받기**: "레이어 단위까지 찾고 싶은 핵심 Figma 기획서 링크를 붙여 주세요 (여러 개, 줄바꿈 구분)" 라고 물어.
-     받은 링크를 그대로 `FD focus add <url> <url> ...` 로 등록. 건너뛰어도 된다.
+   - **지정 파일(레이어까지 찾을 기획서) 받기**: "레이어 단위까지 찾고 싶은 Figma 링크를 붙여 주세요. 파일 링크도 되고, 팀이나 프로젝트 링크를 주면 그 아래 파일을 전부 등록해요" 라고 물어. 건너뛰어도 된다.
+     - 파일 링크(`figma.com/design/…`) → `FD focus add <url> ...`
+     - 팀 링크(`figma.com/files/…/team/<id>/…`)나 프로젝트 링크(`…/project/<id>/…`) → `FD focus add-team <url> ...`
+       결과의 `added`(새 파일 수)와 `estimate_minutes`(예상 시간)를 알려줘. 팀 멤버가 아니면 403 이 난다 → 팀에 가입된 계정으로 Aside 에 로그인했는지 확인.
+       등록한 팀은 기억해 두고, 이후 `/find-doc:reindex` 때마다 새로 생긴 파일을 자동으로 추가한다.
    - 개인 키워드가 있는지 물어(선택): 있으면 `FD config set extra_keywords '["…"]'`.
    - 첫 인덱싱 (둘 다 Bash `run_in_background`, 순서대로):
      1. `FD reindex` — 조직 전체 파일 단위, 3~6분
      2. 지정 파일이 있으면 `FD crawl` — Aside 로 각 파일의 로컬 사본(.fig, 이미지 제외)을 받아 페이지·프레임·레이어를 읽는다.
-        파일당 2~4분. 받은 .fig 는 다운로드 폴더에서 바로 옮겨 해석하고 지운다고 미리 알려.
+        파일당 1~3분. 받은 .fig 는 다운로드 폴더에서 바로 옮겨 해석하고 지운다고 미리 알려.
+        파일이 수십 개면 오래 걸리니 백그라운드로 돌리고, 중간에 멈춰도 다시 실행하면 끝난 파일은 건너뛰고 이어서 한다고 알려.
+        한 번에 일부만 하려면 `FD crawl --limit 20`.
+        실행 중에는 Aside 브라우저에 Figma 탭이 잠깐씩 열렸다 닫힌다 (그동안 Aside 를 다른 용도로 쓰지 않는 게 좋다).
         "120초 안에 저장이 끝나지 않았습니다" 가 나오면: 사용자에게 Aside 에서 그 Figma 파일을 직접 열어 두게 하고,
         `aside repl "console.log(JSON.stringify((await listBrowserTabs()).filter(t=>t.url.includes('<file key>'))))"` 로 탭 id 를 찾아
         `FD crawl --key <file key> --tab <탭 id>` 로 다시 실행.
