@@ -1,0 +1,11 @@
+{
+  "name": "find-doc",
+  "owner": { "name": "tkdals2317" },
+  "plugins": [
+    {
+      "name": "find-doc",
+      "source": "./",
+      "description": "자연어로 Jira·Confluence·Figma 기획서 링크를 찾아준다."
+    }
+  ]
+}
