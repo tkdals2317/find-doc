@@ -72,10 +72,19 @@ FD figma-query <키워드...> [--must <필수 맥락...>] --live --limit 30
 
 ## 5. 출력 형식
 
-```
-🔎 "지원서 기획서" — 범위 figma·jira·conf · Figma 인덱스 2일 전
+**언제 기준인지 항상 밝힌다.** Figma 는 미리 만든 인덱스를 쓰기 때문이다. 시각은 한국 시간(KST)으로.
+- 첫 줄에 기준을 쓴다: `Figma 파일 목록 11/13 · 레이어 11/16 15:08 기준 · Jira·Confluence 실시간`
+  (`file_index_at`, 레이어 후보·파일 후보의 `indexed_at`·`layer_indexed_at` 중 가장 오래된 것과 최신 것)
+- Figma 결과마다 끝에 `(11/16 15:08 인덱싱)` 를 붙인다. 레이어 결과는 `indexed_at`, 파일 결과는 `layer_indexed_at`(없으면 파일 목록 기준).
+- 결과에 쓴 인덱스가 7일 넘게 지났으면 "그 뒤 바뀐 내용은 빠졌을 수 있어요. `/find-doc:reindex` 로 갱신하세요" 를 덧붙인다.
+- 어떤 파일이 들어 있는지 물으면 `/find-doc:status` 를 안내한다.
 
-1. 🎯 [D. 공통 규칙](https://www.figma.com/design/…?node-id=…)   레이어 · 서비스 기획
+
+```
+🔎 "지원서 기획서" — 범위 figma·jira·conf
+   Figma 파일 목록 11/13 · 레이어 11/16 15:08 기준 · Jira·Confluence 실시간
+
+1. 🎯 [D. 공통 규칙](https://www.figma.com/design/…?node-id=…)   레이어 · 서비스 기획 (11/16 15:08 인덱싱)
    🗝️통계 대시보드 기반 › 대시보드 위젯 기본 디자인 › 퍼널 › Funnel – 구성 가이드 › D. 공통 규칙
 2. 🎨 [지원서 리뉴얼 기획서](https://www.figma.com/design/…)   기획서 · 서비스기획팀 · 2024-06
    지원서 작성·제출 화면 리뉴얼 본문. PROJ-1204·1230 에서 참조

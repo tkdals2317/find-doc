@@ -93,6 +93,7 @@ claude plugin update find-doc@find-doc
 |---|---|
 | `/find-doc:search <질문> [--in figma,jira,conf]` | 검색 |
 | `/find-doc:setup` | 최초 설정 / 설정 변경 |
+| `/find-doc:status [--online]` | 무엇이 언제 기준으로 인덱싱됐는지, 제외·실패 파일, (`--online`) 인덱싱 뒤 수정된 파일 |
 | `/find-doc:reindex` | Figma 인덱스 갱신. 일주일에 한 번 권장. 중간에 끊겨도 이어서 진행 |
 | `/find-doc:add <figma 파일 URL> [메모]` | 파일 링크 직접 등록 |
 | `/find-doc:add <팀·프로젝트 URL>` | 그 아래 디자인 파일 전부를 레이어 인덱싱 대상으로 등록 |
@@ -110,7 +111,7 @@ macOS `~/.config/find-doc/`, Windows `%USERPROFILE%\.config\find-doc\`
 └── index/
     ├── figma.jsonl   # Figma 인덱스 (한 줄 = 파일 1개)
     ├── teams.json    # Figma team_id → 팀 이름
-    ├── layers/       # 지정 파일별 레이어 인덱스 (<file key>.jsonl)
+    ├── layers.db     # 레이어 인덱스 (SQLite: 레이어 행 + 검색용 좁은 테이블)
     └── meta.json     # 마지막 갱신 시각, 돌린 키워드
 ```
 

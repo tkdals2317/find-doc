@@ -4,6 +4,7 @@
 stdlib 만 쓴다. 모든 출력은 JSON(stdout). 사람용 메시지는 stderr.
 
   doctor                         설치·로그인·인덱스 상태 점검
+  status [--online]              무엇이 언제 기준으로 인덱싱됐는지 (--online: 인덱싱 뒤 수정된 파일)
   figma-orgs                     Aside 세션으로 내 Figma 조직 목록
   figma-setup --org ID           조직 저장 + 팀 이름표(teams.json) 갱신
   reindex [--max-queries N]      키워드 순회로 Figma 인덱스 갱신 (중단 시 이어하기)
@@ -624,7 +625,10 @@ def cmd_figma_query(a):
     layers = layer_query(kws, a.layer_limit, must)
     out({"ok": True, "keywords": kws, "must": must, "index_files": len(rows),
          "index_age_days": days_since(meta.get("indexed_at")) if meta.get("indexed_at") else None,
-         "live": live, "candidates": [dict(compact(r, s, w), focus=r["key"] in focus) for s, r, w in scored[: a.limit]],
+         "file_index_at": meta.get("indexed_at"),
+         "live": live, "candidates": [dict(compact(r, s, w), focus=r["key"] in focus,
+                                           layer_indexed_at=(meta.get("layers", {}).get(r["key"]) or {}).get("crawled_at"))
+                                      for s, r, w in scored[: a.limit]],
          "layer_index": {"files": len(meta.get("layers", {}))}, "layer_candidates": layers})
 
 
@@ -1188,6 +1192,7 @@ def finish_parse(r, size_mb=None, dl_s=0):
     if "error" in r:
         return r
     with _LOCK:
+        import_layers(r["key"])
         _save_layer_meta(r["key"], r["name"], r["pages"], r["nodes"], r["layers"])
     r.update({"fig_mb": size_mb, "seconds": dl_s + r["parse_seconds"]})
     return r
@@ -1346,78 +1351,222 @@ def cmd_crawl(a):
         res = [late.get(r.get("key"), r) if "error" in r and "layers" in late.get(r.get("key"), {}) else r for r in res]
     close_mcps()
     done = [r for r in res if "layers" in r]
+    with _LOCK:
+        meta = load_json(META, {})
+        meta["last_crawl"] = {"at": now().isoformat(timespec="seconds"), "indexed": len(done),
+                              "skipped": sum("skipped" in r for r in res),
+                              "errors": [{"key": r.get("key"), "name": r.get("name"), "error": r["error"][:160]}
+                                         for r in res if "error" in r]}
+        save_json(META, meta)
     out({"ok": all("error" not in r for r in res), "indexed": len(done),
          "skipped": sum("skipped" in r for r in res), "errors": [r for r in res if "error" in r],
          "layers_total": sum(r["layers"] for r in done), "files": res if len(res) <= 10 else done[:10]})
 
 
-def layer_query(kws, limit, must=None):
+LAYER_DB = os.path.join(IDX_DIR, "layers.db")
+
+
+def _db():
+    import sqlite3
+    os.makedirs(IDX_DIR, exist_ok=True)
+    con = sqlite3.connect(LAYER_DB, timeout=60)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""CREATE TABLE IF NOT EXISTS layers (key TEXT, file TEXT, page TEXT, page_id TEXT, node TEXT,
+                   name TEXT, type TEXT, level INTEGER, path TEXT, text TEXT)""")
+    con.execute("CREATE INDEX IF NOT EXISTS layers_key ON layers(key)")
+    # 검색 전용 좁은 테이블: 이름+텍스트만 (긴 경로·본문을 같이 훑지 않게). id = layers.rowid
+    con.execute("CREATE TABLE IF NOT EXISTS lsearch (id INTEGER PRIMARY KEY, nt TEXT)")
+    con.execute("PRAGMA mmap_size=4000000000")
+    con.execute("PRAGMA cache_size=-200000")
+    con.execute("CREATE TABLE IF NOT EXISTS pages (key TEXT, file TEXT, page TEXT, page_id TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS pages_key ON pages(key)")
+    return con
+
+
+def import_layers(key):
+    """해석 결과 <key>.jsonl 을 SQLite 로 옮기고 jsonl 은 지운다 (같은 파일의 이전 행은 교체)."""
+    path = os.path.join(LAYER_DIR, key + ".jsonl")
+    if not os.path.exists(path):
+        return 0
+    con = _db()
+    n = 0
+    with con:
+        con.execute("DELETE FROM lsearch WHERE id IN (SELECT rowid FROM layers WHERE key = ?)", (key,))
+        con.execute("DELETE FROM layers WHERE key = ?", (key,))
+        con.execute("DELETE FROM pages WHERE key = ?", (key,))
+        pages = {}
+        batch = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pages.setdefault(r["page_id"], (r["key"], r["file"], r["page"], r["page_id"]))
+                batch.append((r["key"], r["file"], r["page"], r["page_id"], r["node"], r["name"], r.get("type"),
+                              r.get("level", 0), r["path"], r.get("text") or ""))
+                if len(batch) >= 20000:
+                    con.executemany("INSERT INTO layers VALUES (?,?,?,?,?,?,?,?,?,?)", batch)
+                    n += len(batch)
+                    batch = []
+        if batch:
+            con.executemany("INSERT INTO layers VALUES (?,?,?,?,?,?,?,?,?,?)", batch)
+            n += len(batch)
+        con.executemany("INSERT INTO pages VALUES (?,?,?,?)", list(pages.values()))
+        con.execute("INSERT INTO lsearch (id, nt) SELECT rowid, lower(substr(name || ' ' || text, 1, 300)) "
+                    "FROM layers WHERE key = ?", (key,))
+    con.close()
+    os.remove(path)
+    return n
+
+
+def migrate_layer_jsonl():
+    """예전 버전이 남긴 layers/*.jsonl 을 한 번 SQLite 로 옮기고, 검색 테이블이 없던 DB 는 채운다."""
+    if os.path.exists(LAYER_DB):
+        con = _db()
+        if con.execute("SELECT 1 FROM lsearch LIMIT 1").fetchone() is None and \
+                con.execute("SELECT 1 FROM layers LIMIT 1").fetchone() is not None:
+            print("  검색 테이블을 만드는 중… (한 번만)", file=sys.stderr, flush=True)
+            with con:
+                con.execute("INSERT INTO lsearch (id, nt) SELECT rowid, lower(substr(name || ' ' || text, 1, 300)) "
+                            "FROM layers")
+        con.close()
     if not os.path.isdir(LAYER_DIR):
+        return
+    for fn in sorted(os.listdir(LAYER_DIR)):
+        if fn.endswith(".jsonl"):
+            print(f"  레이어 인덱스 변환 중: {fn}", file=sys.stderr, flush=True)
+            import_layers(fn[: -len(".jsonl")])
+
+
+def _like(k):
+    return "%" + k.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def layer_query(kws, limit, must=None):
+    migrate_layer_jsonl()
+    if not os.path.exists(LAYER_DB):
         return []
     ks = [k.lower() for k in kws]
+    must = [m.lower() for m in (must or [])]
+    con = _db()
     hits = []
-    for fn in os.listdir(LAYER_DIR):
-        if not fn.endswith(".jsonl"):
+    # 페이지 자체도 후보
+    q = "SELECT key, file, page, page_id FROM pages WHERE " + " OR ".join(["page LIKE ? ESCAPE '\\'"] * len(ks))
+    for key, file, page, pid in con.execute(q, [_like(k) for k in ks]):
+        pn = page.lower()
+        pw = [k for k in ks if has(k, pn)]
+        if pw and all(has(m, pn) for m in must):
+            s = 3 * len(pw) + (3 if len(pw) == len(ks) and len(ks) > 1 else 0) + 1.5
+            hits.append((round(s, 2), {"key": key, "file": file, "page": page, "page_id": pid, "node": pid,
+                                       "name": page, "type": "Page", "level": -1, "path": page}, pw))
+    # 레이어: 이름·텍스트에 키워드가 하나라도 있는 행만 (경로 전체를 훑지 않는다)
+    # 1단계: 좁은 검색 테이블에서 "몇 개의 질문 단어를 담았나" 로 점수 매겨 상위만 (상세 조회를 줄인다)
+    hit = " + ".join(["(s.nt LIKE ? ESCAPE '\\')"] * len(ks))
+    pre = (f"SELECT s.id, ({hit}) AS c FROM lsearch s WHERE c > 0 "
+           f"ORDER BY c DESC, length(s.nt) ASC LIMIT 5000")
+    ids = [r[0] for r in con.execute(pre, [_like(k) for k in ks])]
+    cols = "key, file, page, page_id, node, name, type, level, path, text"
+    if not ids:
+        ids = [-1]
+    sql = f"SELECT {cols} FROM layers WHERE rowid IN ({','.join('?' * len(ids))})"
+    args = ids
+    for row in con.execute(sql, args):
+        r = dict(zip(cols.split(", "), row))
+        if AUTO_NAME.match(r["name"]):
             continue
-        with open(os.path.join(LAYER_DIR, fn), encoding="utf-8") as fh:
-            pages_seen = set()
-            for line in fh:
-                r = json.loads(line)
-                if r["page_id"] not in pages_seen:
-                    # 페이지 자체도 후보 (페이지는 레이어 행이 아니라서 따로 만든다)
-                    pages_seen.add(r["page_id"])
-                    pn = r["page"].lower()
-                    pw = [k for k in ks if has(k, pn)]
-                    if pw and all(has(m, pn) for m in must or []):
-                        s = 3 * len(pw) + (3 if len(pw) == len(ks) and len(ks) > 1 else 0) + 1.5
-                        hits.append((round(s, 2), {"key": r["key"], "file": r["file"], "page": r["page"],
-                                                   "page_id": r["page_id"], "node": r["page_id"], "name": r["page"],
-                                                   "type": "Page", "level": -1, "path": r["page"]}, pw))
-                if AUTO_NAME.match(r["name"]):
-                    continue
-                name = (r["name"] + " " + (r.get("text") or "")).lower()
-                path = r["path"].lower()
-                if must and not all(has(m, path) or has(m, name) for m in must):
-                    continue  # 필수 맥락(페이지·상위 프레임·이름)에 없는 레이어는 제외
-                s, in_name, in_path = 0.0, [], []
-                for k in ks:
-                    if has(k, name):
-                        s += 3
-                        in_name.append(k)
-                    elif has(k, path):
-                        s += 1.5  # 상위 페이지·프레임이 맥락을 준다
-                        in_path.append(k)
-                why = in_name + in_path
-                if not in_name:
-                    continue  # 레이어 이름에 하나도 없으면 상위 노드가 대신 걸린다
-                if len(why) == len(ks) and len(ks) > 1:
-                    s += 3  # 질문 단어를 모두 덮음
-                if len(ks) > 1 and has(" ".join(ks), name):
-                    s += 3  # 질문 구절이 이름에 그대로
-                if r.get("type") in ("FRAME", "SECTION", "COMPONENT", "COMPONENT_SET"):
-                    s += 1
-                elif r.get("type") == "TEXT" and len(r["name"]) > 60:
-                    s -= 1.5  # 긴 본문 텍스트보다 제목·프레임을 우선
-                s -= 0.15 * min(r.get("level", 0), 10)  # 얕은(대표) 노드 우선
-                hits.append((round(s, 2), r, why))
-    hits.sort(key=lambda x: (-x[0], x[1].get("level", 0)))
+        name = (r["name"] + " " + (r.get("text") or "")).lower()
+        path = r["path"].lower()
+        if must and not all(has(m, path) or has(m, name) for m in must):
+            continue  # 필수 맥락(페이지·상위 프레임·이름)에 없는 레이어는 제외
+        s, in_name, in_path = 0.0, [], []
+        for k in ks:
+            if has(k, name):
+                s += 3
+                in_name.append(k)
+            elif has(k, path):
+                s += 1.5  # 상위 페이지·프레임이 맥락을 준다
+                in_path.append(k)
+        why = in_name + in_path
+        if not in_name:
+            continue
+        if len(why) == len(ks) and len(ks) > 1:
+            s += 3  # 질문 단어를 모두 덮음
+        if len(ks) > 1 and has(" ".join(ks), name):
+            s += 3  # 질문 구절이 이름에 그대로
+        if r.get("type") in ("FRAME", "SECTION", "COMPONENT", "COMPONENT_SET"):
+            s += 1
+        elif r.get("type") == "TEXT" and len(r["name"]) > 60:
+            s -= 1.5  # 긴 본문 텍스트보다 제목·프레임을 우선
+        s -= 0.15 * min(r.get("level") or 0, 10)  # 얕은(대표) 노드 우선
+        hits.append((round(s, 2), r, why))
+    con.close()
+    hits.sort(key=lambda x: (-x[0], x[1].get("level") or 0))
+    lm = load_json(META, {}).get("layers", {})
     kept, res, same = [], [], set()
     for s, r, why in hits:
         cp = (r["key"], clean_path(r["path"]))
         if cp in same:
             continue  # 같은 경로의 사본 프레임은 하나만
         same.add(cp)
-        # 이미 고른 노드의 자손이면서 새 단어를 더 덮지 않으면 건너뜀
         if any(r["key"] == k["key"] and r["path"].startswith(k["path"] + " › ") and set(why) <= set(k["why"])
                for k in kept if k["type"] != "Page"):
             continue
         kept.append({"key": r["key"], "path": r["path"], "why": why, "type": r.get("type")})
         res.append({"file": r["file"], "key": r["key"], "page": r["page"], "name": r["name"], "type": r["type"],
                     "path": clean_path(r["path"])[:200], "url": node_url(r["key"], r["node"]), "score": s,
-                    "matched": why})
+                    "matched": why, "indexed_at": (lm.get(r["key"]) or {}).get("crawled_at")})
         if len(res) >= limit:
             break
     return res
+
+
+# ---------- 명령: status ----------
+
+def cmd_status(a):
+    """무엇이, 언제 기준으로 인덱싱돼 있는지."""
+    cfg = load_config()
+    meta = load_json(META, {})
+    lm = meta.get("layers", {})
+    focus = cfg["figma"].get("focus_files", [])
+    rows = load_index()
+    files = []
+    for f in focus:
+        m = lm.get(f["key"]) or {}
+        files.append({"key": f["key"], "name": f["name"], "team": f.get("team"), "folder": f.get("folder"),
+                      "indexed_at": m.get("crawled_at"), "layers": m.get("layers"), "pages": m.get("pages")})
+    stale = None
+    if a.online and focus:
+        vers = file_versions([f["key"] for f in focus])
+        stale = []
+        for f in files:
+            v = vers.get(f["key"]) or {}
+            f["edited_at"] = v.get("edited_at")
+            e, c = _iso(v.get("edited_at")), _iso(f["indexed_at"])
+            if not c or (e and e > c):
+                stale.append({"name": f["name"], "edited_at": v.get("edited_at"), "indexed_at": f["indexed_at"]})
+    done = [f for f in files if f["indexed_at"]]
+    times = sorted(f["indexed_at"] for f in done)
+    db_mb = round(os.path.getsize(LAYER_DB) / 1e6) if os.path.exists(LAYER_DB) else 0
+    out({
+        "ok": True,
+        "file_index": {"files": len(rows), "indexed_at": meta.get("indexed_at"),
+                       "age_days": days_since(meta.get("indexed_at")) if meta.get("indexed_at") else None,
+                       "keywords": len(meta.get("keywords", []))},
+        "layer_index": {"focus_files": len(focus), "indexed_files": len(done),
+                        "not_indexed": [f["name"] for f in files if not f["indexed_at"]][:30],
+                        "layers_total": sum(f["layers"] or 0 for f in done),
+                        "oldest": times[0] if times else None, "newest": times[-1] if times else None,
+                        "db_mb": db_mb},
+        "teams": [{"name": t.get("name"), "kind": t.get("kind"), "url": t.get("url")}
+                  for t in cfg["figma"].get("focus_teams", [])],
+        "excluded": [f"{x['name']} ({x['reason']})" for x in cfg["figma"].get("excluded", [])],
+        "last_crawl": meta.get("last_crawl"),
+        "stale": stale,
+        "files": sorted(files, key=lambda f: f["indexed_at"] or "")[: a.limit],
+        "atlassian": {"jira_projects": cfg["atlassian"]["jira_projects"], "conf_spaces": cfg["atlassian"]["conf_spaces"],
+                      "note": "Jira·Confluence 는 인덱스 없이 검색할 때마다 실시간으로 조회"},
+    })
 
 
 # ---------- 명령: add ----------
@@ -1608,6 +1757,8 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
 
     p = sp.add_parser("doctor"); p.add_argument("--online", action="store_true"); p.set_defaults(fn=cmd_doctor)
+    p = sp.add_parser("status"); p.add_argument("--online", action="store_true", help="파일별 실제 편집 시각을 조회해 인덱싱 뒤에 바뀐 파일을 찾는다")
+    p.add_argument("--limit", type=int, default=200); p.set_defaults(fn=cmd_status)
     p = sp.add_parser("figma-orgs"); p.set_defaults(fn=cmd_figma_orgs)
     p = sp.add_parser("figma-setup"); p.add_argument("--org", required=True); p.add_argument("--name", default="")
     p.set_defaults(fn=cmd_figma_setup)
