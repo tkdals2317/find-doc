@@ -861,25 +861,110 @@ def save_fig(f, tab_id=None):
         return _save_fig(f, tab_id)
 
 
+class AsideMCP:
+    """`aside mcp` 세션 하나. 같은 세션 안에서는 탭과 변수가 repl 호출 사이에 유지된다 (repl 한 번은 120초 제한)."""
+
+    def __init__(self):
+        if not have_aside():
+            raise RuntimeError("aside CLI 가 없습니다.")
+        self.p = subprocess.Popen([shutil.which("aside"), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+        self.n = 0
+        self._rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                                 "clientInfo": {"name": "find-doc", "version": "1"}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _send(self, msg):
+        self.p.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        self.p.stdin.flush()
+
+    def _rpc(self, method, params):
+        self.n += 1
+        self._send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("aside mcp 연결이 끊겼습니다.")
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get("id") == self.n:
+                if "error" in r:
+                    raise RuntimeError(str(r["error"])[:200])
+                return r["result"]
+
+    def repl(self, code):
+        res = self._rpc("tools/call", {"name": "repl", "arguments": {"title": "find-doc", "code": code}})
+        text = "\n".join(c.get("text", "") for c in res.get("content", []))
+        rows = []
+        for line in text.splitlines():
+            i = line.find(MARK)
+            if i >= 0:
+                try:
+                    rows.append(json.loads(line[i + len(MARK):]))
+                except json.JSONDecodeError:
+                    pass
+        return rows, text[-300:]
+
+    def alive(self):
+        return self.p.poll() is None
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_TLS = threading.local()
+_MCPS = []
+SAVE_TOTAL_S = 900   # 큰 파일 하나를 저장하는 데 기다리는 최대 시간 (repl 여러 번에 걸쳐)
+
+
+def _mcp():
+    m = getattr(_TLS, "m", None)
+    if m is None or not m.alive():
+        m = _TLS.m = AsideMCP()
+        with _LOCK:
+            _MCPS.append(m)
+    return m
+
+
+def close_mcps():
+    for m in _MCPS:
+        m.close()
+    _MCPS.clear()
+
+
 def _save_fig(f, tab_id=None):
     tpl = open(os.path.join(HERE, "save-fig.js"), encoding="utf-8").read()
-    params = {"key": f["key"], "tabId": tab_id, "budgetMs": SAVE_BUDGET_MS, "mac": sys.platform == "darwin",
-              "account": load_config()["figma"].get("account", "")}
+    base = {"key": f["key"], "tabId": tab_id, "budgetMs": SAVE_BUDGET_MS, "mac": sys.platform == "darwin",
+            "account": load_config()["figma"].get("account", "")}
     t0 = now().timestamp()
-    js = tpl.replace("__TAG__", f"F{os.getpid()}").replace("__FD_PARAMS__", json.dumps(params))
-    rows, tail = aside_js(js, timeout=170)
-    done = next((r for r in rows if r.get("kind") in ("done", "error")), None)
-    if not done:
-        return None, f"aside 실행 실패: {tail[-200:]}"
+
+    def run(mode):
+        js = tpl.replace("__FD_PARAMS__", json.dumps({**base, "mode": mode}, ensure_ascii=False))
+        try:
+            rows, tail = _mcp().repl(js)
+        except RuntimeError as ex:
+            return {"kind": "error", "error": f"aside 실행 실패: {ex}"}
+        return next((r for r in rows if r.get("kind") in ("done", "error")), None) or \
+            {"kind": "error", "error": f"aside 실행 실패: {tail}"}
+
+    done = run("start")
+    while done.get("kind") == "done" and done.get("state") == "pending":
+        if now().timestamp() - t0 > SAVE_TOTAL_S:
+            run("close")
+            return None, f"{SAVE_TOTAL_S // 60}분 안에 저장이 끝나지 않았습니다."
+        done = run("poll")
     if done["kind"] == "error":
         hint = ""
         if done.get("error") == "no-save-action":
             hint = (" — 자동으로 'Save local copy' 를 열지 못했습니다. Figma 에서 직접 메인 메뉴 › File › Save local copy 로 "
                     "받은 뒤 'crawl --key <file key> --fig <받은 .fig 경로>' 로 인덱싱하세요.")
         return None, f"Figma 저장 실패: {done.get('error')}{hint}"
-    if done.get("state") != "saved":
-        return None, ("120초 안에 저장이 끝나지 않았습니다 (아주 큰 파일). Aside 에서 이 파일을 직접 열어 두고 "
-                      "'crawl --tab' 으로 다시 실행하세요.")
     for _ in range(30):  # 다운로드 마무리 대기
         p = find_saved_fig(t0, f["name"])
         if p and not os.path.exists(p + ".crdownload"):
@@ -889,13 +974,137 @@ def _save_fig(f, tab_id=None):
     return None, "다운로드 폴더에서 .fig 를 찾지 못했습니다."
 
 
-def crawl_file(f, force, tab_id=None, fig_path=None, parse_pool=None):
+CANVAS_FV = 106   # canvas 형식 버전 (.fig 머리의 fig-kiwi 버전과 같다)
+
+
+def _iso(t):
+    """'2026-11-16T05:13:30Z' / isoformat 문자열 → aware datetime (Python 3.9 호환)."""
+    if not t:
+        return None
+    try:
+        return dt.datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def file_versions(keys):
+    """Aside 세션으로 파일별 최신 버전(id, 실제 편집 시각)을 받는다. {key: {vid, edited_at} | {error}}"""
+    res = {}
+    keys = list(keys)
+    for b in range(0, len(keys), 40):
+        chunk = keys[b:b + 40]
+        js = (f"const fdV = await openTab('https://www.figma.com/files/');\n"
+              f"for (const key of {json.dumps(chunk)}) {{\n"
+              f"  const r = await fdV.evaluate(async (k) => {{ try {{ const r = await fetch('/api/versions/' + k);\n"
+              f"    if (r.status !== 200) return {{ status: r.status }};\n"
+              f"    const v = ((await r.json()).meta || {{}}).versions || [];\n"
+              f"    return v.length ? {{ status: 200, vid: v[0].id, edited_at: v[0].created_at }} : {{ status: 200, none: true }};\n"
+              f"  }} catch (e) {{ return {{ status: -1, err: String(e) }}; }} }}, key);\n"
+              f"  console.log({json.dumps(MARK)} + JSON.stringify({{ key, ...r }}));\n"
+              f"}}\n"
+              f"try {{ await closeTab(fdV); }} catch (e) {{}}\n")
+        rows, tail = aside_js(js)
+        for r in rows:
+            if r.get("status") == 200 and r.get("vid"):
+                res[r["key"]] = {"vid": r["vid"], "edited_at": r["edited_at"]}
+            else:
+                res[r["key"]] = {"error": f"버전 정보를 못 받음 (HTTP {r.get('status')})"}
+    return res
+
+
+def canvas_urls(pairs):
+    """(key, vid) 여러 개의 canvas 서명 링크를 탭 하나로 받는다. {key: (url, error)}"""
+    res = {}
+    pairs = list(pairs)
+    for b in range(0, len(pairs), 30):
+        chunk = pairs[b:b + 30]
+        js = (f"const fdC = await openTab('https://www.figma.com/files/');\n"
+              f"for (const [k, v] of {json.dumps(chunk)}) {{\n"
+              f"  const r = await fdC.evaluate(async ([k, v, fv]) => {{ try {{\n"
+              # Range 를 붙이면 일부 파일은 저장소로 넘기지 않고 figma.com 이 직접 준다(쿠키 필요 → Python 에서 403).
+              # 그래서 Range 없이 요청하고, 응답 머리(최종 주소)만 확인한 뒤 본문은 받지 않고 끊는다.
+              f"    const ac = new AbortController();\n"
+              f"    const r = await fetch(`/version/${{v}}/canvas?fk=${{k}}&fv=${{fv}}`, {{ signal: ac.signal }});\n"
+              f"    const out = {{ status: r.status, url: r.url, redirected: r.redirected }};\n"
+              f"    ac.abort();\n"
+              f"    return out;\n"
+              f"  }} catch (e) {{ return {{ status: -1, err: String(e) }}; }} }}, [k, v, {CANVAS_FV}]);\n"
+              f"  console.log({json.dumps(MARK)} + JSON.stringify({{ key: k, ...r }}));\n"
+              f"}}\n"
+              f"try {{ await closeTab(fdC); }} catch (e) {{}}\n")
+        rows, tail = aside_js(js)
+        for r in rows:
+            u = r.get("url") or ""
+            if r.get("status") in (200, 206) and r.get("redirected") and "figma.com" not in u:
+                res[r["key"]] = (u, None)  # 저장소(S3) 서명 링크: 쿠키 없이 받을 수 있다
+            elif r.get("status") in (200, 202, 206):
+                res[r["key"]] = (None, "via-browser")  # 오래된 파일은 Figma 가 직접 준다 → 브라우저에서 받아야 함
+            else:
+                res[r["key"]] = (None, f"canvas 링크를 못 받음 (HTTP {r.get('status')})")
+        for k, _ in chunk:
+            res.setdefault(k, (None, f"canvas 링크를 못 받음 ({tail[-80:]})"))
+    return res
+
+
+def canvas_url(key, vid):
+    return canvas_urls([(key, vid)])[key]
+
+
+def browser_canvas(key, vid, work):
+    """로그인된 Aside 탭 안에서 canvas 를 받아 다운로드 폴더에 '<key>.canvas.fig' 로 저장시키고, 그 파일을 work 로 옮긴다."""
+    name = f"{key}.canvas.fig"
+    target = os.path.join(downloads_dir(), name)
+    if os.path.exists(target):
+        os.remove(target)
+    js = (f"const fdB = await openTab('https://www.figma.com/files/');\n"
+          f"const r = await fdB.evaluate(async ([k, v, fv, name]) => {{ try {{\n"
+          f"  const r = await fetch(`/version/${{v}}/canvas?fk=${{k}}&fv=${{fv}}`, {{ headers: {{ Range: 'bytes=0-' }} }});\n"
+          f"  if (!r.ok) return {{ status: r.status }};\n"
+          f"  const b = await r.blob();\n"
+          f"  const head = String.fromCharCode(...new Uint8Array(await b.slice(0, 8).arrayBuffer()));\n"
+          f"  const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name; a.id = 'fdDl';\n"
+          f"  a.textContent = '.'; a.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647';\n"
+          f"  document.body.appendChild(a);\n"
+          f"  return {{ status: r.status, size: b.size, head }};\n"
+          f"}} catch (e) {{ return {{ status: -1, err: String(e) }}; }} }}, [{json.dumps(key)}, {json.dumps(vid)}, {CANVAS_FV}, {json.dumps(name)}]);\n"
+          f"if (r.head === 'fig-kiwi') {{ await fdB.locator('#fdDl').click(); await sleep(4000); }}\n"
+          f"console.log({json.dumps(MARK)} + JSON.stringify(r));\n"
+          f"try {{ await closeTab(fdB); }} catch (e) {{}}\n")
+    rows, tail = aside_js(js)
+    r = rows[0] if rows else {}
+    if r.get("head") != "fig-kiwi":
+        return f"브라우저에서도 받지 못함 (HTTP {r.get('status')}, {r.get('err') or tail[-80:]})"
+    for _ in range(60):
+        if os.path.exists(target) and not os.path.exists(target + ".crdownload") and os.path.getsize(target) == r["size"]:
+            shutil.move(target, work)
+            return None
+        import time as _t
+        _t.sleep(1)
+    return "브라우저 다운로드가 다운로드 폴더에 나타나지 않음"
+
+
+def download(url, path):
+    req = urllib.request.Request(url, headers={"User-Agent": "find-doc"})
+    with urllib.request.urlopen(req, timeout=600) as r, open(path + ".part", "wb") as fh:
+        shutil.copyfileobj(r, fh, 1 << 20)
+    os.replace(path + ".part", path)
+
+
+def is_up_to_date(f, info, layers_meta=None):
+    """마지막 인덱싱 뒤로 파일이 바뀌지 않았으면 True. 버전 기록의 실제 편집 시각을 시각 단위로 비교한다."""
+    prev = (layers_meta if layers_meta is not None else load_json(META, {}).get("layers", {})).get(f["key"], {})
+    crawled = _iso(prev.get("crawled_at"))
+    if not prev.get("complete") or not crawled:
+        return False
+    edited = _iso((info or {}).get("edited_at"))
+    if edited:
+        return edited <= crawled
+    return days_since(prev.get("crawled_at")) < 30  # 편집 시각을 모르면 30일마다 다시
+
+
+def crawl_file(f, force, tab_id=None, fig_path=None, parse_pool=None, info=None):
     key = f["key"]
-    meta = load_json(META, {})
-    prev = meta.get("layers", {}).get(key, {})
-    file_updated = f.get("updated_at") or (load_index().get(key) or {}).get("updated_at")
-    if (not force and prev.get("complete") and days_since(prev.get("crawled_at")) < 30
-            and (not file_updated or file_updated <= (prev.get("crawled_at") or "")[:10])):
+    if not force and is_up_to_date(f, info):
         return {"key": key, "name": f["name"], "skipped": "최근에 인덱싱했고 파일 수정이 없음"}
     t0 = now()
     os.makedirs(LAYER_DIR, exist_ok=True)
@@ -903,14 +1112,40 @@ def crawl_file(f, force, tab_id=None, fig_path=None, parse_pool=None):
     if fig_path:  # 사용자가 직접 받은 .fig (아주 큰 파일용)
         shutil.copyfile(fig_path, work)
     else:
-        path, err = save_fig(f, tab_id)
+        err = "버전 정보 없음"
+        if info and info.get("vid"):
+            url, err = (info["url"], None) if info.get("url") else \
+                ((None, info["url_error"]) if info.get("url_error") == "via-browser" else canvas_url(key, info["vid"]))
+            for attempt in range(2):
+                if not url:
+                    break
+                try:
+                    download(url, work)
+                    err = None
+                    break
+                except urllib.error.HTTPError as ex:
+                    err = f"canvas 다운로드 실패: HTTP {ex.code}"
+                    if ex.code == 403 and attempt == 0:
+                        url, _ = canvas_url(key, info["vid"])  # 링크가 만료됐을 수 있어 한 번 새로 받는다
+                        continue
+                    break
+                except Exception as ex:  # noqa: BLE001
+                    err = f"canvas 다운로드 실패: {ex}"
+                    break
+            if err == "via-browser" or (err and ("403" in err or "202" in err)):
+                err = browser_canvas(key, info["vid"], work)
+                if err:
+                    return {"key": key, "name": f["name"], "error": err}
         if err:
-            return {"key": key, "name": f["name"], "error": err}
-        shutil.move(path, work)  # 다운로드 폴더에 남기지 않는다
+            # 대체 수단: 브라우저에서 Save local copy
+            path, err2 = save_fig(f, tab_id)
+            if err2:
+                return {"key": key, "name": f["name"], "error": f"{err} / .fig 저장도 실패: {err2}"}
+            shutil.move(path, work)  # 다운로드 폴더에 남기지 않는다
     size_mb = round(os.path.getsize(work) / 1e6, 1)
     dl_s = int((now() - t0).total_seconds())
     if parse_pool is not None:
-        # 해석은 별도 프로세스에 맡기고 이 탭(스레드)은 바로 다음 파일을 받으러 간다
+        # 해석은 별도 프로세스에 맡기고 이 스레드는 바로 다음 파일을 받으러 간다
         return {"key": key, "name": f["name"], "fig_mb": size_mb, "download_seconds": dl_s,
                 "pending": parse_pool.submit(parse_fig_to_index, key, f["name"], work)}
     with _PARSE_LOCK:
@@ -981,6 +1216,35 @@ class _Tee:
         self.fh.flush()
 
 
+def sweep_downloads(files, verbose=True):
+    """시간 초과로 실패했지만 나중에 다운로드 폴더에 저장된 .fig 를 지정 파일과 이름으로 짝지어 인덱싱하고 지운다."""
+    d = downloads_dir()
+    if not os.path.isdir(d):
+        return []
+    lm = load_json(META, {}).get("layers", {})
+    figs = [fn for fn in os.listdir(d) if fn.lower().endswith(".fig")]
+    out_ = []
+    for f in files:
+        if (lm.get(f["key"]) or {}).get("complete") and not f.get("_force"):
+            continue
+        want = _norm(f["name"])
+        if not want:
+            continue
+        hit = [fn for fn in figs if _norm(fn).startswith(want[:60])]
+        if len(hit) != 1:  # 같은 이름이 여럿이면 어느 파일인지 몰라 건너뜀
+            continue
+        path = os.path.join(d, hit[0])
+        r = crawl_file(f, True, None, path)
+        if "layers" in r:
+            os.remove(path)
+            figs.remove(hit[0])
+        if verbose:
+            print(f"  [늦게 저장된 파일] {f['name']}: {r.get('error') or str(r.get('layers')) + '개 레이어'}",
+                  file=sys.stderr, flush=True)
+        out_.append(r)
+    return out_
+
+
 def cmd_crawl(a):
     os.makedirs(IDX_DIR, exist_ok=True)
     sys.stderr = _Tee(sys.stderr, os.path.join(IDX_DIR, "crawl.log"))
@@ -992,11 +1256,27 @@ def cmd_crawl(a):
         files = [f for f in files if f["key"] in a.key]
     if not files:
         die("지정 파일이 없습니다. 'focus add <figma URL...>' 로 먼저 등록하세요.")
+    if a.sweep:
+        r = sweep_downloads(files)
+        out({"ok": True, "picked_up": sum("layers" in x for x in r), "results": r})
+        return
     if a.limit:
         files = files[: a.limit]
+    infos = {}
+    if not (a.fig or a.tab):
+        print(f"  {len(files)}개 파일의 최신 편집 시각을 확인합니다…", file=sys.stderr, flush=True)
+        infos = file_versions([f["key"] for f in files])
+        lm = load_json(META, {}).get("layers", {})
+        todo = [f for f in files if (a.force or not is_up_to_date(f, infos.get(f["key"]), lm))
+                and infos.get(f["key"], {}).get("vid")]
+        if todo:
+            print(f"  바뀌었거나 아직 안 된 파일 {len(todo)}개의 내용 링크를 받습니다…", file=sys.stderr, flush=True)
+            for k, (url, err) in canvas_urls([(f["key"], infos[f["key"]]["vid"]) for f in todo]).items():
+                infos[k]["url"] = url
+                infos[k]["url_error"] = err
     res, cnt = [], [0]
     workers = max(1, min(a.workers, 6)) if not (a.fig or a.tab) else 1
-    pworkers = max(1, min(a.parse_workers, 4))
+    pworkers = max(1, min(a.parse_workers, 6))
 
     def report(f, r):
         with _LOCK:
@@ -1006,7 +1286,7 @@ def cmd_crawl(a):
 
     if workers == 1:
         for f in files:
-            r = crawl_file(f, a.force, a.tab, a.fig)
+            r = crawl_file(f, a.force, a.tab, a.fig, info=infos.get(f["key"]))
             report(f, r)
             res.append(r)
     else:
@@ -1015,7 +1295,7 @@ def cmd_crawl(a):
         pending = []
         with ProcessPoolExecutor(pworkers) as pp:
             def dl(f):
-                r = crawl_file(f, a.force, None, None, pp)
+                r = crawl_file(f, a.force, None, None, pp, info=infos.get(f["key"]))
                 if "pending" in r:
                     fut, size_mb, dl_s = r.pop("pending"), r["fig_mb"], r["download_seconds"]
                     with _LOCK:
@@ -1045,7 +1325,7 @@ def cmd_crawl(a):
                     _t.sleep(1)
                 res += [x.result() for x in futs if x.result()]
     # 일시적인 이유(부하로 Aside 연결 끊김·시간 초과·화면 오류)로 실패한 파일은 한 번, 하나씩 다시 시도
-    transient = re.compile(r"aside 실행 실패|120초|detached|no-save-action|stale|timeout|다운로드 폴더에서", re.I)
+    transient = re.compile(r"aside 실행 실패|120초|분 안에|detached|stale|timeout|다운로드 폴더에서|canvas 링크를 못 받음", re.I)
     retry = [r for r in res if "error" in r and transient.search(r["error"])]
     if retry and not (a.fig or a.tab):
         by_key = {f["key"]: f for f in files}
@@ -1054,10 +1334,17 @@ def cmd_crawl(a):
             f = by_key.get(r["key"])
             if not f:
                 continue
-            r2 = crawl_file(f, a.force)
+            r2 = crawl_file(f, a.force, info=infos.get(f["key"]))
             print(f"  [재시도] {f['name']}: {r2.get('error') or r2.get('skipped') or str(r2.get('layers')) + '개 레이어'}",
                   file=sys.stderr, flush=True)
             res[res.index(r)] = r2
+    if not (a.fig or a.tab):
+        import time as _t
+        _t.sleep(20)  # 시간 초과 뒤 늦게 끝나는 저장을 조금 기다린다
+        late = {x["key"]: x for x in sweep_downloads([f for f in files if any(
+            r.get("key") == f["key"] and "error" in r for r in res)])}
+        res = [late.get(r.get("key"), r) if "error" in r and "layers" in late.get(r.get("key"), {}) else r for r in res]
+    close_mcps()
     done = [r for r in res if "layers" in r]
     out({"ok": all("error" not in r for r in res), "indexed": len(done),
          "skipped": sum("skipped" in r for r in res), "errors": [r for r in res if "error" in r],
@@ -1336,8 +1623,10 @@ def main():
     p.add_argument("--tab", help="Aside 에 직접 열어 둔 Figma 탭 id (큰 파일용)")
     p.add_argument("--fig", help="직접 받은 .fig 파일 경로 (--key 하나와 함께)")
     p.add_argument("--limit", type=int, help="이번에 처리할 최대 파일 수 (나머지는 다음 실행 때)")
-    p.add_argument("--workers", type=int, default=2, help="동시에 여는 Figma 탭 수 (기본 2, 최대 6. 많으면 Aside 가 버거워함)")
-    p.add_argument("--parse-workers", type=int, default=2, help=".fig 해석 프로세스 수 (기본 2, 최대 4, 파일당 메모리 1~3GB)")
+    p.add_argument("--workers", type=int, default=4, help="동시에 받는 파일 수 (기본 4, 최대 6)")
+    p.add_argument("--sweep", action="store_true", help="다운로드 폴더에 늦게 저장된 .fig 만 찾아 인덱싱")
+    p.add_argument("--parse-workers", type=int, default=max(1, min(6, (os.cpu_count() or 2) - 2)),
+                   help=".fig 해석 프로세스 수 (기본: CPU 코어 수 - 2, 최대 6, 큰 파일은 하나에 메모리 1~3GB)")
     p.set_defaults(fn=cmd_crawl)
     p = sp.add_parser("atl-search"); p.add_argument("query"); p.add_argument("--kw", nargs="*")
     p.add_argument("--in", dest="scope", default="jira,conf"); p.add_argument("--jira"); p.add_argument("--conf")

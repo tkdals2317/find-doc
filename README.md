@@ -97,7 +97,7 @@ claude plugin update find-doc@find-doc
 | `/find-doc:add <figma 파일 URL> [메모]` | 파일 링크 직접 등록 |
 | `/find-doc:add <팀·프로젝트 URL>` | 그 아래 디자인 파일 전부를 레이어 인덱싱 대상으로 등록 |
 
-지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--workers 3] [--limit N]` 로 레이어 인덱싱. `--workers` 는 동시에 여는 Figma 탭 수(기본 2, 최대 6), `--parse-workers` 는 .fig 해석 프로세스 수(기본 2). 일시적 오류(Aside 연결 끊김·시간 초과)로 실패한 파일은 끝에 한 번 하나씩 다시 시도한다. 같은 이름 파일은 다운로드가 섞이지 않게 한 번에 하나씩 처리한다.
+지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--workers 3] [--limit N]` 로 레이어 인덱싱. `--workers` 는 동시에 받는 파일 수(기본 4, 최대 6), `--parse-workers` 는 해석 프로세스 수(기본: CPU 코어 수 - 2, 최대 6). 일시적 오류(Aside 연결 끊김·시간 초과)로 실패한 파일은 끝에 한 번 하나씩 다시 시도한다. 같은 이름 파일은 다운로드가 섞이지 않게 한 번에 하나씩 처리한다.
 
 ## 파일 위치
 
@@ -127,10 +127,12 @@ macOS `~/.config/find-doc/`, Windows `%USERPROFILE%\.config\find-doc\`
 - Figma 인덱싱은 Figma 웹이 내부적으로 쓰는 검색 API(`/api/search/full_results`)를 내 로그인 세션으로 조회만 한다. 공개 API 가 아니라서 Figma 가 바꾸면 깨질 수 있다. 깨지면 reindex 가 "응답 모양이 바뀌었습니다"라고 알리고 기존 인덱스는 그대로 쓴다. 고칠 곳은 `scripts/finddoc.py` 의 `figma_search()` 하나다.
 - Figma 검색은 한 번에 최대 약 70개만 돌려준다. 그래서 키워드를 여러 개 돌려서 합치고, 새로 찾은 파일명에서 키워드를 더 뽑아 최대 2바퀴 더 돈다.
 - Atlassian Rovo(MCP)는 쓰지 않는다. 회사 IP 허용 목록 때문에 Claude 커넥터가 막히고, 크레딧도 소모한다.
-- 레이어 인덱싱은 Aside 로 Figma 의 "Save local copy" 를 실행해 **.fig 사본(이미지 제외)** 을 받고, `scripts/figfile.py` 가 그 안의 kiwi 형식을 직접 해석한다. 모든 페이지·프레임·텍스트와 node-id 가 들어 있어 화면을 펼칠 필요가 없다. 노드 83만 개짜리 파일 기준 저장 약 1.5분 + 해석 약 80초. 받은 .fig 는 다운로드 폴더에서 옮겨 해석한 뒤 지운다.
-  - 저장 흐름이 깨지면(Figma 문구 변경) `scripts/save-fig.js`, 형식이 바뀌면 `scripts/figfile.py` 를 고친다.
+- 레이어 인덱싱은 파일의 **버전 기록**(`/api/versions/<key>`)에서 최신 버전을 찾고, 그 버전의 **파일 전체 내용(canvas, fig-kiwi 형식)** 을 받아 `scripts/figfile.py` 가 직접 해석한다. 모든 페이지·프레임·텍스트와 node-id 가 들어 있어 화면을 펼칠 필요가 없다.
+  - 링크는 로그인된 Aside 탭 하나로 여러 파일 것을 한꺼번에 받고, 내용은 Figma 저장소(S3) 서명 링크라 Python 이 직접 받는다. 오래된 일부 파일은 Figma 가 직접 내주는데 로그인이 필요해서, 그때는 Aside 탭 안에서 받아 다운로드 폴더에 `<key>.canvas.fig` 로 저장한 뒤 옮겨 해석하고 지운다.
+  - 변경 감지는 버전 기록의 **실제 편집 시각**과 마지막 인덱싱 시각을 시각 단위로 비교한다 (파일 목록의 `updated_at` 은 내용 편집과 상관없어서 쓰지 않는다).
+  - 이 방식이 안 되면 예전 방식(브라우저에서 "Save local copy" 로 .fig 저장)으로 자동으로 넘어간다. 저장 흐름이 깨지면 `scripts/save-fig.js`, 형식이 바뀌면 `scripts/figfile.py` 를 고친다.
+  - 참고 속도(팀 75개, 다운로드 4개·해석 6개 동시): 바뀐 파일 25개를 7분 안에 받고, 큰 파일(노드 17만 개) 해석은 3~4분.
   - .fig 데이터는 zstd 압축이다. Python 3.14 이상은 기본 지원, 그 아래는 `pip install zstandard` 또는 `zstd` 명령줄 도구(`brew install zstd` / `winget install zstd`)를 쓴다. `doctor` 의 `zstd` 가 false 면 셋 중 하나를 설치한다.
-  - 120초 안에 저장이 안 끝나는 아주 큰 파일은 Aside 에서 파일을 직접 열어 두고 `crawl --tab <탭 id>` 로 실행한다.
 - 인덱싱에는 LLM 토큰이 들지 않는다 (Python + Aside 브라우저 스크립트). Claude 토큰은 명령을 실행하고 결과를 요약할 때만 든다.
 
 ## 고친 내용 반영하기 (관리자)
