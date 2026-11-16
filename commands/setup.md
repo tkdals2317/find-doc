@@ -48,6 +48,7 @@ description: find-doc 최초 설정 (Atlassian 주소·자격증명, Jira 프로
         파일이 수십 개면 오래 걸리니 백그라운드로 돌리고, 중간에 멈춰도 다시 실행하면 끝난 파일은 건너뛰고 이어서 한다고 알려.
         한 번에 일부만 하려면 `FD crawl --limit 20`.
         실행 중에는 Aside 브라우저에 Figma 탭이 잠깐씩 열렸다 닫힌다 (그동안 Aside 를 다른 용도로 쓰지 않는 게 좋다).
+        진행 상황은 `/find-doc-progress` 로 채팅 옆 패널(또는 입력창 위 한 줄)에서 볼 수 있다고 알려.
         "120초 안에 저장이 끝나지 않았습니다" 가 나오면: 사용자에게 Aside 에서 그 Figma 파일을 직접 열어 두게 하고,
         `aside repl "console.log(JSON.stringify((await listBrowserTabs()).filter(t=>t.url.includes('<file key>'))))"` 로 탭 id 를 찾아
         `FD crawl --key <file key> --tab <탭 id>` 로 다시 실행.

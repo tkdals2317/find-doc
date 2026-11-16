@@ -10,6 +10,7 @@ argument-hint: "[--restart] [--layers-only] [--force]"
 1. `--layers-only` 가 없으면: `FD reindex` (+ `--restart` 가 있으면 붙여서)
 2. 지정 파일이 있으면: `FD crawl` (+ `--force` 가 있으면 붙여서). Figma 탭 2개로 동시에 받고 해석은 별도 프로세스 2개로 한다. 등록된 팀·프로젝트는 먼저 새 파일을 자동으로 추가하고, 수정되지 않은 파일은 건너뛴다. 파일이 많으면 오래 걸릴 수 있으니 백그라운드로 돌리고, 끝나면 `indexed`·`skipped`·`errors` 수를 한 줄로 알려줘.
 
+- 레이어 인덱싱(crawl) 중에는 "`/find-doc-progress` 로 진행 상황을 볼 수 있어요" 라고 한 줄 알려준다.
 - 진행 상황(stderr)은 길게 옮기지 말고, 끝났을 때 한두 줄로 요약해: 파일 수, 새 파일 수, 레이어 수, 일부만 읽힌 페이지 수.
 - `ok: false` 면 `error` 를 그대로 보여주고 안내해:
   - 로그인 문제 → Aside 브라우저에서 figma.com 에 로그인한 뒤 다시 `/find-doc:reindex` (중단 지점부터 이어서 진행)
