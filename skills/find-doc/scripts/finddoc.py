@@ -12,7 +12,7 @@ stdlib 만 쓴다. 모든 출력은 JSON(stdout). 사람용 메시지는 stderr.
   atl-search QUERY --kw KW... [--in jira,conf] [--jira P,..] [--conf S,..]
                                  Jira·Confluence JQL/CQL 검색
   add URL [NOTE...]              Figma 링크 직접 등록 (파일 단위)
-  focus add URL... | focus add-team TEAM_OR_PROJECT_URL... | focus remove KEY... | focus list
+  focus add URL... | focus add-team TEAM_OR_PROJECT_URL... | focus include KEY... | focus remove KEY... | focus list
                                  레이어까지 깊게 인덱싱할 '지정 파일' 관리
   crawl [--key KEY...] [--force] [--tab ID]
                                  지정 파일의 .fig 사본을 받아 페이지·프레임·레이어 인덱싱 (파일당 수 분)
@@ -382,7 +382,15 @@ def atl_request(base, path, params):
 def cmd_doctor(a):
     cfg = load_config()
     meta = load_json(META, {})
+    zstd_ok = sys.version_info >= (3, 14) or shutil.which("zstd") is not None
+    if not zstd_ok:
+        try:
+            import zstandard  # noqa: F401
+            zstd_ok = True
+        except ImportError:
+            pass
     rep = {"ok": True, "config_path": CONFIG, "aside": have_aside(),
+           "python": sys.version.split()[0], "zstd": zstd_ok,
            "figma": {"enabled": cfg["figma"]["enabled"], "org_id": cfg["figma"]["org_id"],
                      "org_name": cfg["figma"]["org_name"]},
            "index": {"files": len(load_index()), "indexed_at": meta.get("indexed_at"),
@@ -675,6 +683,24 @@ def team_files(url):
     return src, files
 
 
+LOW_VALUE = [
+    (re.compile(r"^untitled(\s*\(\d+\)|\s+\d+)?$", re.I), "제목 없음(Untitled)"),
+    (re.compile(r"\(community\)", re.I), "커뮤니티 복사본"),
+    (re.compile(r"\(copy\)|\bcopy\b|사본|복사본", re.I), "복사본"),
+    (re.compile(r"백업|backup|보관함|archive", re.I), "백업·보관용"),
+    (re.compile(r"^(test|테스트|연습|playground|sandbox)\b|\b(test|테스트)$", re.I), "테스트용"),
+]
+
+
+def low_value_reason(name):
+    """이름만 봐서 검색에 쓸모없어 보이는 파일이면 그 이유, 아니면 None."""
+    n = (name or "").strip()
+    for rx, why in LOW_VALUE:
+        if rx.search(n):
+            return why
+    return None
+
+
 def sync_focus_teams(cfg, verbose=True):
     """등록된 팀·프로젝트의 파일 목록을 다시 받아 지정 파일에 반영한다 (새 파일 추가, 수정일 갱신)."""
     files = cfg["figma"].setdefault("focus_files", [])
@@ -686,10 +712,19 @@ def sync_focus_teams(cfg, verbose=True):
         except RuntimeError as ex:
             print(f"  팀 {t.get('name')}: {ex}", file=sys.stderr)
             continue
+        include = set(cfg["figma"].get("include_keys", []))
+        excluded = {x["key"]: x for x in cfg["figma"].setdefault("excluded", [])}
         for f in tf:
             if f["editor_type"] not in CRAWL_TYPES:
                 skipped_types += 1
                 continue
+            why = None if f["key"] in include else low_value_reason(f["name"])
+            if why:
+                excluded[f["key"]] = {"key": f["key"], "name": f["name"], "reason": why, "team": src["name"]}
+                if f["key"] in by_key and by_key[f["key"]].get("team"):  # 팀에서 들어온 것만 뺀다 (직접 추가한 건 유지)
+                    files.remove(by_key.pop(f["key"]))
+                continue
+            excluded.pop(f["key"], None)
             cur = by_key.get(f["key"])
             if cur:
                 cur.update({"name": f["name"], "updated_at": f["updated_at"], "folder": f["folder"]})
@@ -699,9 +734,13 @@ def sync_focus_teams(cfg, verbose=True):
                 files.append(e)
                 by_key[f["key"]] = e
                 added.append(f["name"])
+        cfg["figma"]["excluded"] = list(excluded.values())
     save_json(CONFIG, cfg)
     if verbose and added:
         print(f"  팀에서 새 파일 {len(added)}개 추가", file=sys.stderr)
+    if verbose and cfg["figma"].get("excluded"):
+        print(f"  의미 없어 보이는 파일 {len(cfg['figma']['excluded'])}개는 제외 (focus list 로 확인, focus include <key> 로 되돌리기)",
+              file=sys.stderr)
     return added, skipped_types
 
 
@@ -737,11 +776,26 @@ def cmd_focus(a):
                 teams.append(src)
             srcs.append({**src, "files": len(tf), "design_files": sum(f["editor_type"] in CRAWL_TYPES for f in tf)})
         added, skipped = sync_focus_teams(cfg, verbose=False)
-        todo = len(added)
+        todo = len(added)  # noqa: F841
+        ex = cfg["figma"].get("excluded", [])
         out({"ok": True, "sources": srcs, "added": len(added), "added_names": added[:30],
              "skipped_non_design": skipped, "focus_files": len(cfg["figma"]["focus_files"]),
+             "excluded": len(ex), "excluded_files": [f"{x['name']} ({x['reason']})" for x in ex][:40],
+             "excluded_hint": "필요한 파일이 빠졌으면 'focus include <file key>' 로 다시 넣을 수 있습니다.",
              "estimate_minutes": [todo * 1, todo * 3],
              "next": "crawl 을 실행하면 새로 추가된 파일을 하나씩 인덱싱합니다 (파일당 1~3분, 중간에 멈춰도 다시 실행하면 이어서)."})
+    elif a.action == "include":
+        inc = cfg["figma"].setdefault("include_keys", [])
+        back = [x for x in cfg["figma"].get("excluded", []) if x["key"] in a.urls]
+        for x in back:
+            if x["key"] not in inc:
+                inc.append(x["key"])
+            if not any(f["key"] == x["key"] for f in files):
+                files.append({"key": x["key"], "name": x["name"], "url": f"https://www.figma.com/design/{x['key']}",
+                              "team": x.get("team")})
+        cfg["figma"]["excluded"] = [x for x in cfg["figma"].get("excluded", []) if x["key"] not in a.urls]
+        save_json(CONFIG, cfg)
+        out({"ok": True, "included": [x["name"] for x in back]})
     elif a.action == "remove":
         cfg["figma"]["focus_files"] = [x for x in files if x["key"] not in a.urls]
         cfg["figma"]["focus_teams"] = [t for t in cfg["figma"].get("focus_teams", []) if t["id"] not in a.urls]
@@ -750,6 +804,7 @@ def cmd_focus(a):
     else:
         lm = load_json(META, {}).get("layers", {})
         out({"ok": True, "focus_teams": cfg["figma"].get("focus_teams", []),
+             "excluded": cfg["figma"].get("excluded", []),
              "focus_files": [dict(x, layers=(lm.get(x["key"]) or {}).get("layers")) for x in files]})
 
 
@@ -834,8 +889,7 @@ def _save_fig(f, tab_id=None):
     return None, "다운로드 폴더에서 .fig 를 찾지 못했습니다."
 
 
-def crawl_file(f, force, tab_id=None, fig_path=None):
-    import figfile
+def crawl_file(f, force, tab_id=None, fig_path=None, parse_pool=None):
     key = f["key"]
     meta = load_json(META, {})
     prev = meta.get("layers", {}).get(key, {})
@@ -854,15 +908,26 @@ def crawl_file(f, force, tab_id=None, fig_path=None):
             return {"key": key, "name": f["name"], "error": err}
         shutil.move(path, work)  # 다운로드 폴더에 남기지 않는다
     size_mb = round(os.path.getsize(work) / 1e6, 1)
+    dl_s = int((now() - t0).total_seconds())
+    if parse_pool is not None:
+        # 해석은 별도 프로세스에 맡기고 이 탭(스레드)은 바로 다음 파일을 받으러 간다
+        return {"key": key, "name": f["name"], "fig_mb": size_mb, "download_seconds": dl_s,
+                "pending": parse_pool.submit(parse_fig_to_index, key, f["name"], work)}
+    with _PARSE_LOCK:
+        r = parse_fig_to_index(key, f["name"], work)
+    return finish_parse(r, size_mb, dl_s)
+
+
+def parse_fig_to_index(key, name, work):
+    """(별도 프로세스에서도 실행) .fig → 레이어 인덱스 jsonl. 결과 요약을 돌려준다."""
+    import figfile
+    t1 = now()
     try:
-        t1 = now()
-        with _PARSE_LOCK:
-            rows = figfile.layers(work)
-        parse_s = int((now() - t1).total_seconds())
+        rows = figfile.layers(work)
     except Exception as ex:  # noqa: BLE001
         bad = work + ".failed"
         os.replace(work, bad)  # 해석기 수정용으로 남긴다 (다음 성공 시 지움)
-        return {"key": key, "name": f["name"], "error": f".fig 해석 실패: {type(ex).__name__}: {str(ex)[:120]}",
+        return {"key": key, "name": name, "error": f".fig 해석 실패: {type(ex).__name__}: {str(ex)[:120]}",
                 "kept_for_debug": bad}
     os.remove(work)
     if os.path.exists(work + ".failed"):
@@ -875,25 +940,50 @@ def crawl_file(f, force, tab_id=None, fig_path=None):
                 continue
             if r["type"] == "TEXT" and r["level"] > 12:
                 continue
-            fh.write(json.dumps({"key": key, "file": f["name"], **r, "path": clean_path(r["path"])},
+            fh.write(json.dumps({"key": key, "file": name, **r, "path": clean_path(r["path"])},
                                 ensure_ascii=False) + "\n")
             kept += 1
     os.replace(tmp, os.path.join(LAYER_DIR, key + ".jsonl"))
+    return {"key": key, "name": name, "nodes": len(rows), "pages": len({r["page_id"] for r in rows}),
+            "layers": kept, "parse_seconds": int((now() - t1).total_seconds())}
+
+
+def finish_parse(r, size_mb=None, dl_s=0):
+    """해석 결과를 meta 에 기록하고 최종 결과 dict 로 만든다 (메인 프로세스에서만)."""
+    if "error" in r:
+        return r
     with _LOCK:
-        _save_layer_meta(key, f["name"], rows, kept)
-    return {"key": key, "name": f["name"], "fig_mb": size_mb, "nodes": len(rows), "layers": kept,
-            "parse_seconds": parse_s, "seconds": int((now() - t0).total_seconds())}
+        _save_layer_meta(r["key"], r["name"], r["pages"], r["nodes"], r["layers"])
+    r.update({"fig_mb": size_mb, "seconds": dl_s + r["parse_seconds"]})
+    return r
 
 
-def _save_layer_meta(key, name, rows, kept):
+def _save_layer_meta(key, name, pages, nodes, kept):
     meta = load_json(META, {})
     meta.setdefault("layers", {})[key] = {"name": name, "crawled_at": now().isoformat(timespec="seconds"),
-                                          "pages": len({r["page_id"] for r in rows}), "nodes": len(rows),
+                                          "pages": pages, "nodes": nodes,
                                           "layers": kept, "complete": True}
     save_json(META, meta)
 
 
+class _Tee:
+    """crawl 진행 상황을 stderr 와 ~/.config/find-doc/index/crawl.log 에 함께 쓴다 (진행 패널이 읽음)."""
+    def __init__(self, stream, path):
+        self.stream, self.fh = stream, open(path, "w", encoding="utf-8")
+
+    def write(self, t):
+        self.stream.write(t)
+        self.fh.write(t)
+        self.fh.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+
+
 def cmd_crawl(a):
+    os.makedirs(IDX_DIR, exist_ok=True)
+    sys.stderr = _Tee(sys.stderr, os.path.join(IDX_DIR, "crawl.log"))
     cfg = load_config()
     if cfg["figma"].get("focus_teams") and not a.key and not a.fig:
         sync_focus_teams(cfg)
@@ -906,22 +996,68 @@ def cmd_crawl(a):
         files = files[: a.limit]
     res, cnt = [], [0]
     workers = max(1, min(a.workers, 6)) if not (a.fig or a.tab) else 1
+    pworkers = max(1, min(a.parse_workers, 4))
 
-    def run(f):
-        r = crawl_file(f, a.force, a.tab, a.fig)
+    def report(f, r):
         with _LOCK:
             cnt[0] += 1
             msg = r.get("error") or r.get("skipped") or f"{r.get('layers')}개 레이어 ({r.get('seconds')}초)"
             print(f"  [{cnt[0]}/{len(files)}] {f['name']}: {msg}", file=sys.stderr, flush=True)
-        return r
 
     if workers == 1:
-        res = [run(f) for f in files]
+        for f in files:
+            r = crawl_file(f, a.force, a.tab, a.fig)
+            report(f, r)
+            res.append(r)
     else:
-        from concurrent.futures import ThreadPoolExecutor
-        print(f"  {len(files)}개 파일을 탭 {workers}개로 동시에 처리합니다", file=sys.stderr, flush=True)
-        with ThreadPoolExecutor(workers) as ex:
-            res = list(ex.map(run, files))
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+        print(f"  {len(files)}개 파일: 다운로드 탭 {workers}개 + 해석 프로세스 {pworkers}개", file=sys.stderr, flush=True)
+        pending = []
+        with ProcessPoolExecutor(pworkers) as pp:
+            def dl(f):
+                r = crawl_file(f, a.force, None, None, pp)
+                if "pending" in r:
+                    fut, size_mb, dl_s = r.pop("pending"), r["fig_mb"], r["download_seconds"]
+                    with _LOCK:
+                        pending.append((f, fut, size_mb, dl_s))
+                    print(f"    ↳ {f['name']}: 저장 완료 ({dl_s}초, {size_mb}MB) → 해석 대기열", file=sys.stderr, flush=True)
+                    return None
+                report(f, r)
+                return r
+            with ThreadPoolExecutor(workers) as ex:
+                futs = [ex.submit(dl, f) for f in files]
+                # 다운로드가 도는 동안 끝난 해석부터 바로 기록
+                while True:
+                    with _LOCK:
+                        ready = [p for p in pending if p[1].done()]
+                        for p in ready:
+                            pending.remove(p)
+                    for f, fut, size_mb, dl_s in ready:
+                        try:
+                            r = finish_parse(fut.result(), size_mb, dl_s)
+                        except Exception as ex2:  # noqa: BLE001
+                            r = {"key": f["key"], "name": f["name"], "error": f"해석 프로세스 오류: {ex2}"}
+                        report(f, r)
+                        res.append(r)
+                    if all(x.done() for x in futs) and not pending:
+                        break
+                    import time as _t
+                    _t.sleep(1)
+                res += [x.result() for x in futs if x.result()]
+    # 일시적인 이유(부하로 Aside 연결 끊김·시간 초과·화면 오류)로 실패한 파일은 한 번, 하나씩 다시 시도
+    transient = re.compile(r"aside 실행 실패|120초|detached|no-save-action|stale|timeout|다운로드 폴더에서", re.I)
+    retry = [r for r in res if "error" in r and transient.search(r["error"])]
+    if retry and not (a.fig or a.tab):
+        by_key = {f["key"]: f for f in files}
+        print(f"  일시적 오류 {len(retry)}개를 하나씩 다시 시도합니다", file=sys.stderr, flush=True)
+        for r in retry:
+            f = by_key.get(r["key"])
+            if not f:
+                continue
+            r2 = crawl_file(f, a.force)
+            print(f"  [재시도] {f['name']}: {r2.get('error') or r2.get('skipped') or str(r2.get('layers')) + '개 레이어'}",
+                  file=sys.stderr, flush=True)
+            res[res.index(r)] = r2
     done = [r for r in res if "layers" in r]
     out({"ok": all("error" not in r for r in res), "indexed": len(done),
          "skipped": sum("skipped" in r for r in res), "errors": [r for r in res if "error" in r],
@@ -1194,13 +1330,14 @@ def main():
     p.add_argument("--limit", type=int, default=30); p.add_argument("--layer-limit", type=int, default=20)
     p.add_argument("--must", nargs="*", help="필수 맥락 단어: 페이지·상위 프레임·이름에 반드시 있어야 하는 단어 (예: 파싱)")
     p.set_defaults(fn=cmd_figma_query)
-    p = sp.add_parser("focus"); p.add_argument("action", choices=["add", "add-team", "remove", "list"]); p.add_argument("urls", nargs="*")
+    p = sp.add_parser("focus"); p.add_argument("action", choices=["add", "add-team", "include", "remove", "list"]); p.add_argument("urls", nargs="*")
     p.set_defaults(fn=cmd_focus)
     p = sp.add_parser("crawl"); p.add_argument("--key", nargs="*"); p.add_argument("--force", action="store_true")
     p.add_argument("--tab", help="Aside 에 직접 열어 둔 Figma 탭 id (큰 파일용)")
     p.add_argument("--fig", help="직접 받은 .fig 파일 경로 (--key 하나와 함께)")
     p.add_argument("--limit", type=int, help="이번에 처리할 최대 파일 수 (나머지는 다음 실행 때)")
-    p.add_argument("--workers", type=int, default=3, help="동시에 여는 Figma 탭 수 (기본 3, 최대 6)")
+    p.add_argument("--workers", type=int, default=2, help="동시에 여는 Figma 탭 수 (기본 2, 최대 6. 많으면 Aside 가 버거워함)")
+    p.add_argument("--parse-workers", type=int, default=2, help=".fig 해석 프로세스 수 (기본 2, 최대 4, 파일당 메모리 1~3GB)")
     p.set_defaults(fn=cmd_crawl)
     p = sp.add_parser("atl-search"); p.add_argument("query"); p.add_argument("--kw", nargs="*")
     p.add_argument("--in", dest="scope", default="jira,conf"); p.add_argument("--jira"); p.add_argument("--conf")

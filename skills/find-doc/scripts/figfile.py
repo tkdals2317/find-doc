@@ -23,7 +23,17 @@ def _inflate(b):
                 import zstandard  # pip install zstandard (Python 3.13 이하)
                 return zstandard.ZstdDecompressor().decompressobj().decompress(b)
             except ImportError:
-                raise RuntimeError("zstd 압축 해제가 필요합니다. Python 3.14 이상을 쓰거나 'pip install zstandard' 를 실행하세요.")
+                pass
+            # 마지막 수단: zstd 명령줄 도구 (brew install zstd / winget install zstd)
+            import shutil
+            import subprocess
+            exe = shutil.which("zstd")
+            if exe:
+                p = subprocess.run([exe, "-d", "-c"], input=b, capture_output=True)
+                if p.returncode == 0:
+                    return p.stdout
+            raise RuntimeError("zstd 압축 해제가 필요합니다. Python 3.14 이상을 쓰거나 'pip install zstandard' "
+                               "또는 zstd 도구(brew install zstd)를 설치하세요.")
     try:
         return zlib.decompress(b, -15)
     except zlib.error:

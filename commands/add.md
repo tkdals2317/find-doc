@@ -6,7 +6,7 @@ argument-hint: <figma 파일 URL> [메모] | <팀·프로젝트 URL>
 `FD = python3 ${CLAUDE_PLUGIN_ROOT}/skills/find-doc/scripts/finddoc.py`
 
 - 링크가 팀(`figma.com/files/…/team/<id>/…`)이나 프로젝트(`…/project/<id>/…`)면: `FD focus add-team $ARGUMENTS`
-  새로 추가된 파일 수와 예상 시간을 알려주고, "지금 인덱싱할까요?" 라고 물어 → 좋다고 하면 `FD crawl` 을 Bash `run_in_background` 로.
+  새로 추가된 파일 수와 예상 시간, 그리고 의미 없어 보여 뺀 파일 목록(`excluded_files`, 이유 포함)을 보여주고 "필요한 게 있으면 말해 달라 (focus include 로 되돌림)" 고 안내한 뒤, "지금 인덱싱할까요?" 라고 물어 → 좋다고 하면 `FD crawl` 을 Bash `run_in_background` 로.
 - 파일 링크(`figma.com/design/…`)면: `FD add $ARGUMENTS` 로 등록하고 등록된 이름·메모를 한 줄로 알려줘.
   레이어까지 찾고 싶다고 하면 `FD focus add <url>` 후 `FD crawl --key <file key>`.
 

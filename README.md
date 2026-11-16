@@ -70,7 +70,7 @@
 순서: Atlassian 주소 → 토큰 등록(본인 터미널에서 직접 입력) → Jira 프로젝트 → Confluence 스페이스 → Figma 조직 연결 → **레이어까지 찾을 Figma 링크**(파일·팀·프로젝트 링크) → 첫 인덱싱.
 
 - 조직 전체 파일 인덱스: 3~6분
-- 레이어 인덱스: 파일당 1~3분. **팀이나 프로젝트 링크를 주면 그 아래 디자인 파일을 전부** 등록하고, 이후 reindex 때 새 파일도 자동으로 추가한다 (팀 멤버여야 목록이 보인다). 파일이 많으면 오래 걸리니 백그라운드로 돌리고, 멈춰도 다시 실행하면 이어서 한다.
+- 레이어 인덱스: 파일당 1~3분. **팀이나 프로젝트 링크를 주면 그 아래 디자인 파일을 전부** 등록하되, 이름으로 봐서 의미 없는 파일(Untitled, 커뮤니티 복사본, `(Copy)`·사본, 백업·보관함, 테스트)은 빼고 그 목록을 보여준다(`focus include <file key>` 로 되돌리기). 이후 이후 reindex 때 새 파일도 자동으로 추가한다 (팀 멤버여야 목록이 보인다). 파일이 많으면 오래 걸리니 백그라운드로 돌리고, 멈춰도 다시 실행하면 이어서 한다.
 
 ## 업데이트
 
@@ -97,7 +97,7 @@ claude plugin update find-doc@find-doc
 | `/find-doc:add <figma 파일 URL> [메모]` | 파일 링크 직접 등록 |
 | `/find-doc:add <팀·프로젝트 URL>` | 그 아래 디자인 파일 전부를 레이어 인덱싱 대상으로 등록 |
 
-지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--workers 3] [--limit N]` 로 레이어 인덱싱. `--workers` 는 동시에 여는 Figma 탭 수(기본 3, 최대 6). 같은 이름 파일은 다운로드가 섞이지 않게 한 번에 하나씩 처리한다.
+지정 파일 관리(직접 실행할 때): `finddoc.py focus add <파일 url...>` / `focus add-team <팀·프로젝트 url...>` / `focus list` / `focus remove <file key 또는 team id>` → `finddoc.py crawl [--workers 3] [--limit N]` 로 레이어 인덱싱. `--workers` 는 동시에 여는 Figma 탭 수(기본 2, 최대 6), `--parse-workers` 는 .fig 해석 프로세스 수(기본 2). 일시적 오류(Aside 연결 끊김·시간 초과)로 실패한 파일은 끝에 한 번 하나씩 다시 시도한다. 같은 이름 파일은 다운로드가 섞이지 않게 한 번에 하나씩 처리한다.
 
 ## 파일 위치
 
@@ -129,7 +129,7 @@ macOS `~/.config/find-doc/`, Windows `%USERPROFILE%\.config\find-doc\`
 - Atlassian Rovo(MCP)는 쓰지 않는다. 회사 IP 허용 목록 때문에 Claude 커넥터가 막히고, 크레딧도 소모한다.
 - 레이어 인덱싱은 Aside 로 Figma 의 "Save local copy" 를 실행해 **.fig 사본(이미지 제외)** 을 받고, `scripts/figfile.py` 가 그 안의 kiwi 형식을 직접 해석한다. 모든 페이지·프레임·텍스트와 node-id 가 들어 있어 화면을 펼칠 필요가 없다. 노드 83만 개짜리 파일 기준 저장 약 1.5분 + 해석 약 80초. 받은 .fig 는 다운로드 폴더에서 옮겨 해석한 뒤 지운다.
   - 저장 흐름이 깨지면(Figma 문구 변경) `scripts/save-fig.js`, 형식이 바뀌면 `scripts/figfile.py` 를 고친다.
-  - .fig 데이터는 zstd 압축이다. Python 3.14 이상은 기본 지원, 그 아래는 `pip install zstandard`.
+  - .fig 데이터는 zstd 압축이다. Python 3.14 이상은 기본 지원, 그 아래는 `pip install zstandard` 또는 `zstd` 명령줄 도구(`brew install zstd` / `winget install zstd`)를 쓴다. `doctor` 의 `zstd` 가 false 면 셋 중 하나를 설치한다.
   - 120초 안에 저장이 안 끝나는 아주 큰 파일은 Aside 에서 파일을 직접 열어 두고 `crawl --tab <탭 id>` 로 실행한다.
 - 인덱싱에는 LLM 토큰이 들지 않는다 (Python + Aside 브라우저 스크립트). Claude 토큰은 명령을 실행하고 결과를 요약할 때만 든다.
 
